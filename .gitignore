@@ -1,6 +1,8 @@
 # Project runtime outputs
 backend/uploads/
 backend/mineru_output/
+backend/magic-pdf.json
+backend/mineru.json
 *_presentation.pptx
 *_layout.pdf
 *_origin.pdf
@@ -97,6 +99,7 @@ docs/_build/
 /site
 
 # Local workspace and editor state
+.python-version
 .claude/
 .shared/
 .ropeproject
@@ -105,6 +108,7 @@ docs/_build/
 .cursorignore
 .cursorindexingignore
 .pypirc
+claude_kimi.ps1
 
 # Optional IDE settings
 #.idea/
