@@ -1,4 +1,5 @@
 # Project runtime outputs
+backend/.env
 backend/uploads/
 backend/mineru_output/
 backend/magic-pdf.json
@@ -97,6 +98,10 @@ profile_default/
 ipython_config.py
 docs/_build/
 /site
+backend/app/test.ipynb
+artifacts/*debug*.json
+artifacts/openclaw_pdf_compare_summary.json
+artifacts/openclaw_text_shapes_latest.json
 
 # Local workspace and editor state
 .python-version
