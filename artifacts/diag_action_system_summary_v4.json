@@ -1,0 +1,279 @@
+{
+  "pdf": "d:\\product_codes\\PDF2PPT\\backend\\uploads\\aa3ab65601454c1186c320aa8a58b6ec_行动系统_新的万亿级护城河.pdf",
+  "slide_count": 16,
+  "pptx_path": "D:\\product_codes\\PDF2PPT\\backend\\mineru_output\\diag-action-system-v4_presentation.pptx",
+  "slides": [
+    {
+      "page_id": 1,
+      "archetype": "single_visual_explainer",
+      "width": 1376.0,
+      "height": 768.0,
+      "element_count": 2,
+      "text_count": 2,
+      "image_count": 0,
+      "table_count": 0,
+      "default_render_mode": "auto",
+      "current_render_mode": "auto",
+      "confidence": {
+        "archetype": 0.8,
+        "render_mode": 0.55,
+        "semantic_roles": 0.7
+      }
+    },
+    {
+      "page_id": 2,
+      "archetype": "infographic_node_map",
+      "width": 1376.0,
+      "height": 768.0,
+      "element_count": 10,
+      "text_count": 7,
+      "image_count": 3,
+      "table_count": 0,
+      "default_render_mode": "auto",
+      "current_render_mode": "auto",
+      "confidence": {
+        "archetype": 0.8,
+        "render_mode": 0.55,
+        "semantic_roles": 0.7
+      }
+    },
+    {
+      "page_id": 3,
+      "archetype": "infographic_node_map",
+      "width": 1376.0,
+      "height": 768.0,
+      "element_count": 7,
+      "text_count": 5,
+      "image_count": 2,
+      "table_count": 0,
+      "default_render_mode": "auto",
+      "current_render_mode": "auto",
+      "confidence": {
+        "archetype": 0.8,
+        "render_mode": 0.55,
+        "semantic_roles": 0.7
+      }
+    },
+    {
+      "page_id": 4,
+      "archetype": "infographic_node_map",
+      "width": 1376.0,
+      "height": 768.0,
+      "element_count": 12,
+      "text_count": 10,
+      "image_count": 2,
+      "table_count": 0,
+      "default_render_mode": "image_fallback",
+      "current_render_mode": "image_fallback",
+      "confidence": {
+        "archetype": 0.8,
+        "render_mode": 0.65,
+        "semantic_roles": 0.7
+      }
+    },
+    {
+      "page_id": 5,
+      "archetype": "infographic_node_map",
+      "width": 1376.0,
+      "height": 768.0,
+      "element_count": 7,
+      "text_count": 4,
+      "image_count": 3,
+      "table_count": 0,
+      "default_render_mode": "auto",
+      "current_render_mode": "auto",
+      "confidence": {
+        "archetype": 0.8,
+        "render_mode": 0.55,
+        "semantic_roles": 0.7
+      }
+    },
+    {
+      "page_id": 6,
+      "archetype": "infographic_node_map",
+      "width": 1376.0,
+      "height": 768.0,
+      "element_count": 7,
+      "text_count": 4,
+      "image_count": 3,
+      "table_count": 0,
+      "default_render_mode": "auto",
+      "current_render_mode": "auto",
+      "confidence": {
+        "archetype": 0.8,
+        "render_mode": 0.55,
+        "semantic_roles": 0.7
+      }
+    },
+    {
+      "page_id": 7,
+      "archetype": "infographic_node_map",
+      "width": 1376.0,
+      "height": 768.0,
+      "element_count": 6,
+      "text_count": 5,
+      "image_count": 1,
+      "table_count": 0,
+      "default_render_mode": "auto",
+      "current_render_mode": "auto",
+      "confidence": {
+        "archetype": 0.8,
+        "render_mode": 0.55,
+        "semantic_roles": 0.7
+      }
+    },
+    {
+      "page_id": 8,
+      "archetype": "infographic_node_map",
+      "width": 1376.0,
+      "height": 768.0,
+      "element_count": 7,
+      "text_count": 6,
+      "image_count": 1,
+      "table_count": 0,
+      "default_render_mode": "auto",
+      "current_render_mode": "auto",
+      "confidence": {
+        "archetype": 0.8,
+        "render_mode": 0.55,
+        "semantic_roles": 0.7
+      }
+    },
+    {
+      "page_id": 9,
+      "archetype": "infographic_node_map",
+      "width": 1376.0,
+      "height": 768.0,
+      "element_count": 7,
+      "text_count": 6,
+      "image_count": 1,
+      "table_count": 0,
+      "default_render_mode": "auto",
+      "current_render_mode": "auto",
+      "confidence": {
+        "archetype": 0.8,
+        "render_mode": 0.55,
+        "semantic_roles": 0.7
+      }
+    },
+    {
+      "page_id": 10,
+      "archetype": "two_column_compare",
+      "width": 1376.0,
+      "height": 768.0,
+      "element_count": 7,
+      "text_count": 5,
+      "image_count": 2,
+      "table_count": 0,
+      "default_render_mode": "auto",
+      "current_render_mode": "auto",
+      "confidence": {
+        "archetype": 0.8,
+        "render_mode": 0.55,
+        "semantic_roles": 0.7
+      }
+    },
+    {
+      "page_id": 11,
+      "archetype": "infographic_node_map",
+      "width": 1376.0,
+      "height": 768.0,
+      "element_count": 9,
+      "text_count": 8,
+      "image_count": 1,
+      "table_count": 0,
+      "default_render_mode": "image_fallback",
+      "current_render_mode": "image_fallback",
+      "confidence": {
+        "archetype": 0.8,
+        "render_mode": 0.65,
+        "semantic_roles": 0.7
+      }
+    },
+    {
+      "page_id": 12,
+      "archetype": "roadmap_overview",
+      "width": 1376.0,
+      "height": 768.0,
+      "element_count": 22,
+      "text_count": 21,
+      "image_count": 1,
+      "table_count": 0,
+      "default_render_mode": "image_fallback",
+      "current_render_mode": "image_fallback",
+      "confidence": {
+        "archetype": 0.8,
+        "render_mode": 0.65,
+        "semantic_roles": 0.7
+      }
+    },
+    {
+      "page_id": 13,
+      "archetype": "infographic_node_map",
+      "width": 1376.0,
+      "height": 768.0,
+      "element_count": 14,
+      "text_count": 10,
+      "image_count": 4,
+      "table_count": 0,
+      "default_render_mode": "image_fallback",
+      "current_render_mode": "image_fallback",
+      "confidence": {
+        "archetype": 0.8,
+        "render_mode": 0.65,
+        "semantic_roles": 0.7
+      }
+    },
+    {
+      "page_id": 14,
+      "archetype": "infographic_node_map",
+      "width": 1376.0,
+      "height": 768.0,
+      "element_count": 8,
+      "text_count": 7,
+      "image_count": 1,
+      "table_count": 0,
+      "default_render_mode": "auto",
+      "current_render_mode": "auto",
+      "confidence": {
+        "archetype": 0.8,
+        "render_mode": 0.55,
+        "semantic_roles": 0.7
+      }
+    },
+    {
+      "page_id": 15,
+      "archetype": "infographic_node_map",
+      "width": 1376.0,
+      "height": 768.0,
+      "element_count": 10,
+      "text_count": 10,
+      "image_count": 0,
+      "table_count": 0,
+      "default_render_mode": "auto",
+      "current_render_mode": "auto",
+      "confidence": {
+        "archetype": 0.8,
+        "render_mode": 0.55,
+        "semantic_roles": 0.7
+      }
+    },
+    {
+      "page_id": 16,
+      "archetype": "multi_visual_explainer",
+      "width": 1376.0,
+      "height": 768.0,
+      "element_count": 7,
+      "text_count": 4,
+      "image_count": 3,
+      "table_count": 0,
+      "default_render_mode": "auto",
+      "current_render_mode": "auto",
+      "confidence": {
+        "archetype": 0.8,
+        "render_mode": 0.55,
+        "semantic_roles": 0.7
+      }
+    }
+  ]
+}
