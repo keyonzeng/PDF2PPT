@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "backend"
 version = "0.1.0"
@@ -8,14 +12,18 @@ dependencies = [
     "accelerate>=1.12.0",
     "doclayout-yolo>=0.0.4",
     "fastapi>=0.128.0",
+    "ftfy>=6.3.1",
     "mineru>=2.7.1",
+    "omegaconf>=2.3.0",
     "pydantic-settings>=2.12.0",
+    "pyclipper>=1.3.0.post6",
     "python-multipart>=0.0.22",
     "python-pptx>=0.6.23",
     "openai>=1.61.0",
     "google-genai>=1.0.0",
     "google-auth>=2.0.0",
     "google-auth-oauthlib>=1.0.0",
+    "shapely>=2.0.0",
     "supabase>=2.27.3",
     "tokenizers>=0.22.2",
     "torch>=2.10.0",
@@ -32,3 +40,19 @@ explicit = true
 [tool.uv.sources]
 torch = { index = "pytorch" }
 torchvision = { index = "pytorch" }
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]
+
+[project.scripts]
+pdf2ppt = "pdf2ppt_cli:main"
+
+[tool.setuptools]
+py-modules = ["cli", "pdf2ppt_cli"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*"]
+namespaces = true

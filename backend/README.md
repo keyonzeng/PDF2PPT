@@ -23,6 +23,18 @@ uv sync
 uv run uvicorn app.main:app --reload
 ```
 
+### Run CLI
+```bash
+uv run pdf2ppt input.pdf -o output.pptx
+```
+
+### CLI Options
+- `--template default`
+- `--request-id <id>`
+- `--output-root <path>`: mirror MinerU artifacts after success
+- `--enable-llm`
+- `--json`
+
 ### Run Tests
 ```bash
 uv run python -m tests.test_parser

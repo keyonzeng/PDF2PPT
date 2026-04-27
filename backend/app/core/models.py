@@ -12,6 +12,7 @@ class StyleToken(BaseModel):
     color: Optional[str] = None
     bold: Optional[bool] = None
     align: Optional[str] = None
+    font_name: Optional[str] = None
 
 class DocumentStyleProfile(BaseModel):
     page_width: float = 1280.0
@@ -42,6 +43,12 @@ class TextElement(Element):
     color: Optional[str] = None
     text_level: Optional[int] = None
     semantic_role: Optional[str] = None
+    align: Optional[str] = None
+    bold: Optional[bool] = None
+    font_name: Optional[str] = None
+    line_texts: Optional[List[str]] = None
+    line_bboxes: Optional[List[List[float]]] = None
+    line_font_sizes: Optional[List[float]] = None
 
 class ImageElement(Element):
     type: str = "image"
@@ -53,11 +60,12 @@ class TableElement(Element):
 
 class Slide(BaseModel):
     page_id: int
-    elements: List[Element] = Field(default_factory=list)
+    elements: List[Union[TextElement, ImageElement, TableElement, Element]] = Field(default_factory=list)
     width: float = 1280.0
     height: float = 720.0
     archetype: str = "single_visual_explainer"
     style_profile: Optional[DocumentStyleProfile] = None
+    render_mode: Optional[str] = None
     
     def add_element(self, element: Element):
         self.elements.append(element)

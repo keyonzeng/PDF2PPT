@@ -1,11 +1,20 @@
+import io
+
 from pptx import Presentation
 from pptx.dml.color import RGBColor
-from pptx.enum.text import PP_ALIGN
+from pptx.enum.text import PP_ALIGN, MSO_ANCHOR, MSO_AUTO_SIZE
 from pptx.util import Pt, Inches
+from pptx.oxml.ns import qn
+from pptx.oxml.xmlchemy import OxmlElement
 from PIL import Image
 from app.core.models import Presentation as DomainPresentation
 from app.core.models import TextElement, DocumentStyleProfile
 from pathlib import Path
+
+try:
+    import pypdfium2 as pdfium
+except ImportError:  # pragma: no cover - optional runtime dependency
+    pdfium = None
 
 # Minimalist PPT Generator
 BASE_DIR = Path(__file__).resolve().parents[2]
@@ -78,72 +87,127 @@ def _alignment_value(value: str | None):
     return PP_ALIGN.LEFT
 
 
+def _set_run_font_name(run, font_name: str) -> None:
+    if not font_name:
+        return
+    run.font.name = font_name
+    r_pr = run._r.get_or_add_rPr()
+    for tag in ("a:latin", "a:ea", "a:cs"):
+        font = r_pr.find(qn(tag))
+        if font is None:
+            font = OxmlElement(tag)
+            r_pr.append(font)
+        font.set("typeface", font_name)
+
+
+def _infer_font_name(text: str, preferred: str | None = None) -> str:
+    if preferred:
+        return preferred
+    if any("\u4e00" <= ch <= "\u9fff" for ch in text):
+        return "Microsoft YaHei"
+    return "Arial"
+
+
+def _box_height_points(textbox) -> float:
+    return textbox.height / 12700 if textbox.height else 0.0
+
+
+def _resolved_font_size_pt(textbox, elem: TextElement, fallback: float) -> float:
+    explicit = getattr(elem, "font_size", None)
+    if explicit:
+        return max(float(explicit), 8.0)
+    line_count = max(len(getattr(elem, "line_texts", None) or [line for line in (elem.content or "").splitlines() if line.strip()]), 1)
+    box_height = _box_height_points(textbox)
+    if box_height <= 0:
+        return fallback
+    estimated = box_height * 0.72 if line_count == 1 else box_height / (line_count * 1.35)
+    return max(min(estimated, box_height * 0.85 if box_height else estimated), 8.0)
+
+
+def _paragraph_font_size_pt(textbox, elem: TextElement, paragraph_index: int, fallback: float) -> float:
+    line_font_sizes = getattr(elem, "line_font_sizes", None) or []
+    if paragraph_index < len(line_font_sizes):
+        return max(float(line_font_sizes[paragraph_index]), 8.0)
+    return _resolved_font_size_pt(textbox, elem, fallback)
+
+
+def _should_word_wrap_text(elem: TextElement, content: str, line_texts: list[str]) -> bool:
+    role = getattr(elem, "semantic_role", None)
+    if len(line_texts) > 1:
+        return False
+    if role in {"body", "subtitle", "caption"} and len(content) >= 18:
+        return True
+    return False
+
+
 def _apply_text_style(textbox, elem: TextElement, is_cover_slide: bool) -> None:
     text_frame = textbox.text_frame
-    paragraph = text_frame.paragraphs[0]
-    run = paragraph.runs[0] if paragraph.runs else paragraph.add_run()
     role = getattr(elem, "semantic_role", None)
     content = (elem.content or "").strip()
     slide = textbox.part.slide
     profile = getattr(slide, "_pdf2ppt_style_profile", None)
     archetype = getattr(slide, "_pdf2ppt_archetype", "single_visual_explainer")
+    profile_font_name = getattr(getattr(profile, "body_style", None), "font_name", None)
+    resolved_font_name = _infer_font_name(content, getattr(elem, "font_name", None) or profile_font_name)
+    is_short_year_label = archetype == "two_column_compare" and role == "subtitle" and content.isdigit() and len(content) <= 8
 
-    title_color = _hex_to_rgb(getattr(profile, "primary_color", None), (32, 48, 64))
-    subtitle_color = _hex_to_rgb(getattr(profile, "secondary_color", None), (120, 120, 120))
-    accent_color = _hex_to_rgb(getattr(profile, "accent_color", None), (15, 58, 120))
+    title_color = _hex_to_rgb(getattr(elem, "color", None), (17, 17, 17))
+    subtitle_color = _hex_to_rgb(getattr(elem, "color", None), (48, 114, 208) if is_short_year_label else (68, 68, 68))
+    accent_color = _hex_to_rgb(getattr(elem, "color", None), (17, 17, 17))
 
-    paragraph.alignment = _alignment_value(getattr(getattr(profile, "body_style", None), "align", "left"))
+    for paragraph_index, paragraph in enumerate(text_frame.paragraphs):
+        run = paragraph.runs[0] if paragraph.runs else paragraph.add_run()
+        paragraph.alignment = _alignment_value(getattr(elem, "align", None) or getattr(getattr(profile, "body_style", None), "align", "left"))
+        paragraph.space_before = Pt(0)
+        paragraph.space_after = Pt(0)
 
-    if is_cover_slide and role == "title":
-        run.font.size = Pt(36)
-        run.font.bold = True
-        run.font.color.rgb = accent_color
-        paragraph.alignment = PP_ALIGN.LEFT
-    elif is_cover_slide and role in {"subtitle", "body"} and len(content) <= 40:
-        run.font.size = Pt(18)
-        run.font.bold = False
-        run.font.color.rgb = subtitle_color
-        paragraph.alignment = PP_ALIGN.LEFT
-    elif role == "title":
-        run.font.size = Pt(getattr(getattr(profile, "title_style", None), "font_size", 24) or 24)
-        run.font.bold = True
-        run.font.color.rgb = title_color
-        paragraph.alignment = _alignment_value(getattr(getattr(profile, "title_style", None), "align", "left"))
-    elif role == "subtitle":
-        run.font.size = Pt(getattr(getattr(profile, "subtitle_style", None), "font_size", 18) or 18)
-        run.font.bold = False
-        run.font.color.rgb = subtitle_color
-        paragraph.alignment = _alignment_value(getattr(getattr(profile, "subtitle_style", None), "align", "left"))
-    elif role == "caption":
-        run.font.size = Pt(getattr(getattr(profile, "caption_style", None), "font_size", 12) or 12)
-        run.font.bold = False
-        run.font.color.rgb = subtitle_color
-        paragraph.alignment = _alignment_value(getattr(getattr(profile, "caption_style", None), "align", "left"))
-    else:
-        run.font.size = Pt(getattr(getattr(profile, "body_style", None), "font_size", 16) or 16)
-        run.font.bold = False
-        run.font.color.rgb = title_color
-
-    if archetype == "roadmap_overview" and role != "title" and len(content) <= 10:
-        run.font.size = Pt(11 if role == "caption" else 12)
-        paragraph.alignment = PP_ALIGN.CENTER
-    if archetype == "two_column_compare" and content.strip().isdigit() is False and content.startswith("202"):
-        run.font.size = Pt(22)
-        run.font.bold = True
-        run.font.color.rgb = accent_color
-        paragraph.alignment = PP_ALIGN.CENTER
-    if archetype == "infographic_node_map" and role == "caption":
-        run.font.size = Pt(11)
-        paragraph.alignment = PP_ALIGN.CENTER
-    if archetype == "policy_text_heavy" and role == "title":
-        run.font.size = Pt(26)
-    if archetype == "closing_statement":
-        if role == "title":
-            run.font.size = Pt(30)
-            run.font.bold = True
+        if is_cover_slide and role == "title":
+            run.font.size = Pt(_paragraph_font_size_pt(textbox, elem, paragraph_index, 30))
+            is_split_parenthetical_line = (paragraph_index > 0 and (paragraph.text or "").strip().startswith(("（", "("))) or content.startswith(("（", "("))
+            run.font.bold = False if is_split_parenthetical_line else True
+            run.font.color.rgb = subtitle_color if is_split_parenthetical_line else accent_color
+            _set_run_font_name(run, _infer_font_name(content, getattr(elem, "font_name", None) or getattr(getattr(profile, "title_style", None), "font_name", None) or resolved_font_name))
+            paragraph.alignment = _alignment_value(getattr(elem, "align", None) or "left")
+        elif is_cover_slide and role in {"subtitle", "body"} and len(content) <= 40:
+            run.font.size = Pt(_paragraph_font_size_pt(textbox, elem, paragraph_index, 18))
+            run.font.bold = bool(getattr(elem, "bold", None))
+            run.font.color.rgb = subtitle_color
+            _set_run_font_name(run, _infer_font_name(content, getattr(elem, "font_name", None) or getattr(getattr(profile, "subtitle_style", None), "font_name", None) or resolved_font_name))
+            paragraph.alignment = _alignment_value(getattr(elem, "align", None) or "left")
+        elif role == "title":
+            run.font.size = Pt(_paragraph_font_size_pt(textbox, elem, paragraph_index, getattr(getattr(profile, "title_style", None), "font_size", 24) or 24))
+            is_split_parenthetical_line = (paragraph_index > 0 and (paragraph.text or "").strip().startswith(("（", "("))) or content.startswith(("（", "("))
+            run.font.bold = False if is_split_parenthetical_line else (True if getattr(elem, "bold", None) is None else bool(getattr(elem, "bold", None)))
+            run.font.color.rgb = subtitle_color if is_split_parenthetical_line else title_color
+            _set_run_font_name(run, _infer_font_name(content, getattr(elem, "font_name", None) or getattr(getattr(profile, "title_style", None), "font_name", None) or resolved_font_name))
+            paragraph.alignment = _alignment_value(getattr(elem, "align", None) or getattr(getattr(profile, "title_style", None), "align", "left"))
+        elif role == "subtitle":
+            run.font.size = Pt(_paragraph_font_size_pt(textbox, elem, paragraph_index, getattr(getattr(profile, "subtitle_style", None), "font_size", 18) or 18))
+            run.font.bold = bool(getattr(elem, "bold", None))
+            run.font.color.rgb = subtitle_color
+            _set_run_font_name(run, _infer_font_name(content, getattr(elem, "font_name", None) or getattr(getattr(profile, "subtitle_style", None), "font_name", None) or resolved_font_name))
+            paragraph.alignment = _alignment_value(getattr(elem, "align", None) or getattr(getattr(profile, "subtitle_style", None), "align", "left"))
+        elif role == "caption":
+            run.font.size = Pt(_paragraph_font_size_pt(textbox, elem, paragraph_index, getattr(getattr(profile, "caption_style", None), "font_size", 12) or 12))
+            run.font.bold = bool(getattr(elem, "bold", None))
+            run.font.color.rgb = subtitle_color
+            _set_run_font_name(run, _infer_font_name(content, getattr(elem, "font_name", None) or getattr(getattr(profile, "caption_style", None), "font_name", None) or resolved_font_name))
+            paragraph.alignment = _alignment_value(getattr(elem, "align", None) or getattr(getattr(profile, "caption_style", None), "align", "left"))
         else:
-            run.font.size = Pt(18)
-        paragraph.alignment = PP_ALIGN.CENTER
+            run.font.size = Pt(_paragraph_font_size_pt(textbox, elem, paragraph_index, getattr(getattr(profile, "body_style", None), "font_size", 16) or 16))
+            run.font.bold = bool(getattr(elem, "bold", None))
+            run.font.color.rgb = title_color
+            _set_run_font_name(run, resolved_font_name)
+
+        if archetype == "infographic_node_map" and role == "caption":
+            run.font.size = Pt(11)
+            paragraph.alignment = PP_ALIGN.CENTER
+        if archetype == "policy_text_heavy" and role == "title":
+            run.font.size = Pt(26)
+
+        font_size = run.font.size
+        if font_size is not None:
+            paragraph.line_spacing = Pt(max(float(font_size.pt) * 1.0, 1.0))
 
 
 def _apply_archetype_layout_hints(slide, d_slide, profile: DocumentStyleProfile) -> None:
@@ -175,78 +239,307 @@ def _element_geometry(elem, pdf_w: float, pdf_h: float, ppt_w: int, ppt_h: int) 
     return left, top, width, height
 
 
+def _slide_page_index(d_slide) -> int:
+    page_id = int(getattr(d_slide, "page_id", 1) or 1)
+    return max(page_id - 1, 0)
+
+
 def _render_text_element(slide, elem, left: int, top: int, width: int, height: int, is_cover_slide: bool) -> None:
     textbox = slide.shapes.add_textbox(left, top, width, height)
+    textbox.fill.background()
+    textbox.line.fill.background()
     tf = textbox.text_frame
-    tf.text = elem.content
-    tf.word_wrap = True
+    tf.vertical_anchor = MSO_ANCHOR.TOP
+    tf.auto_size = MSO_AUTO_SIZE.NONE
     tf.margin_left = 0
     tf.margin_right = 0
     tf.margin_top = 0
     tf.margin_bottom = 0
+    line_texts = [line for line in (getattr(elem, "line_texts", None) or []) if line.strip()]
+    role = getattr(elem, "semantic_role", None)
+    should_render_lines_as_paragraphs = len(line_texts) > 1
+    if should_render_lines_as_paragraphs:
+        first_paragraph = tf.paragraphs[0]
+        first_paragraph.text = line_texts[0]
+        for line_text in line_texts[1:]:
+            paragraph = tf.add_paragraph()
+            paragraph.text = line_text
+    else:
+        tf.text = (elem.content or "").replace("\n", "\v")
+    tf.word_wrap = _should_word_wrap_text(elem, elem.content or "", line_texts)
     _apply_text_style(textbox, elem, is_cover_slide)
 
 
-def _render_picture_element(slide, elem, left: int, top: int, width: int, height: int) -> None:
+def _iter_text_overlay_units(elem: TextElement, archetype: str | None = None) -> list[TextElement]:
+    return [elem]
+
+
+def _render_text_elements_only(slide, d_slide, pdf_w: float, pdf_h: float, ppt_w: int, ppt_h: int, is_cover_slide: bool) -> None:
+    archetype = getattr(d_slide, "archetype", None)
+    for elem in _sorted_elements_for_render(d_slide):
+        if elem.type != "text" or not elem.bbox:
+            continue
+        for overlay_elem in _iter_text_overlay_units(elem, archetype):
+            if not overlay_elem.bbox:
+                continue
+            left, top, width, height = _element_geometry(overlay_elem, pdf_w, pdf_h, ppt_w, ppt_h)
+            _render_text_element(slide, overlay_elem, left, top, width, height, is_cover_slide)
+
+
+def _render_page_image(source_pdf_document, page_index: int, page_image_cache: dict[int, Image.Image]) -> Image.Image | None:
+    cached = page_image_cache.get(page_index)
+    if cached is not None:
+        return cached
+
+    if source_pdf_document is None or pdfium is None:
+        return None
+
+    try:
+        page = source_pdf_document[page_index]
+        bitmap = page.render(scale=2.0)
+        pil_image = bitmap.to_pil()
+    except Exception:
+        return None
+
+    page_image_cache[page_index] = pil_image
+    return pil_image
+
+
+def _render_picture_element(slide, elem, left: int, top: int, width: int, height: int, image_size_cache: dict[str, tuple[int, int]], source_pdf_document=None, page_index: int | None = None, pdf_w: float | None = None, pdf_h: float | None = None, page_image_cache: dict[int, Image.Image] | None = None) -> None:
     img_path = getattr(elem, "path", None)
     if img_path and Path(img_path).exists():
-        _add_picture_cover(slide, img_path, left, top, width, height)
+        _add_picture_cover(slide, img_path, left, top, width, height, image_size_cache)
+        return
+
+    if source_pdf_document is None or page_index is None or pdf_w is None or pdf_h is None:
+        return
+
+    if page_image_cache is None:
+        page_image_cache = {}
+    page_image = _render_page_image(source_pdf_document, page_index, page_image_cache)
+    if page_image is None:
+        return
+
+    bbox = getattr(elem, "bbox", None) or []
+    if len(bbox) != 4:
+        return
+
+    page_width, page_height = page_image.size
+    x0, y0, x1, y1 = [float(value) for value in bbox]
+    crop_left = max(0, min(page_width, int(round((x0 / max(pdf_w, 1.0)) * page_width))))
+    crop_top = max(0, min(page_height, int(round((y0 / max(pdf_h, 1.0)) * page_height))))
+    crop_right = max(crop_left + 1, min(page_width, int(round((x1 / max(pdf_w, 1.0)) * page_width))))
+    crop_bottom = max(crop_top + 1, min(page_height, int(round((y1 / max(pdf_h, 1.0)) * page_height))))
+
+    try:
+        cropped = page_image.crop((crop_left, crop_top, crop_right, crop_bottom))
+    except Exception:
+        return
+
+    stream = io.BytesIO()
+    cropped.save(stream, format="PNG")
+    stream.seek(0)
+    slide.shapes.add_picture(stream, left, top, width=width, height=height)
 
 
-def _render_generic_archetype(slide, d_slide, pdf_w: float, pdf_h: float, ppt_w: int, ppt_h: int, is_cover_slide: bool) -> None:
+def _page_snapshot_candidate(d_slide):
+    visual_elements = [element for element in d_slide.elements if element.type in {"image", "table"} and getattr(element, "path", None)]
+    if not visual_elements:
+        return None
+
+    def _area(element):
+        bbox = element.bbox or [0, 0, 0, 0]
+        if len(bbox) != 4:
+            return 0
+        return max((bbox[2] - bbox[0]) * (bbox[3] - bbox[1]), 0)
+
+    return max(visual_elements, key=_area)
+
+
+def _slide_has_visual_blocks(d_slide) -> bool:
+    return any(element.type in {"image", "table"} for element in d_slide.elements)
+
+
+def _has_resolvable_visual_assets(d_slide) -> bool:
+    for element in d_slide.elements:
+        if element.type not in {"image", "table"}:
+            continue
+        img_path = getattr(element, "path", None)
+        if img_path and Path(img_path).exists():
+            return True
+    return False
+
+
+def _snapshot_area_ratio(d_slide) -> float:
+    snapshot = _page_snapshot_candidate(d_slide)
+    if snapshot is None or not snapshot.bbox or len(snapshot.bbox) != 4:
+        return 0.0
+    page_area = max((d_slide.width or 1280.0) * (d_slide.height or 720.0), 1.0)
+    bbox = snapshot.bbox
+    snapshot_area = max((bbox[2] - bbox[0]) * (bbox[3] - bbox[1]), 0.0)
+    return snapshot_area / page_area
+
+
+def _render_page_snapshot(slide, d_slide, ppt_w: int, ppt_h: int, is_cover_slide: bool, image_size_cache: dict[str, tuple[int, int]]) -> bool:
+    snapshot = _page_snapshot_candidate(d_slide)
+    if snapshot is None:
+        return False
+
+    img_path = getattr(snapshot, "path", None)
+    if not img_path or not Path(img_path).exists():
+        return False
+
+    _add_picture_cover(slide, img_path, 0, 0, ppt_w, ppt_h, image_size_cache)
+
+    title_elements = [
+        element
+        for element in _sorted_elements_for_render(d_slide)
+        if element.type == "text" and getattr(element, "semantic_role", None) in {"title", "subtitle"}
+    ]
+
+    for element in title_elements[:2]:
+        if not element.bbox:
+            continue
+        left, top, width, height = _element_geometry(element, d_slide.width or 1280.0, d_slide.height or 720.0, ppt_w, ppt_h)
+        _render_text_element(slide, element, left, top, width, height, is_cover_slide)
+
+    return True
+
+
+def _render_pdf_page_snapshot(slide, source_pdf_document, page_index: int, ppt_w: int, ppt_h: int) -> bool:
+    if source_pdf_document is None or pdfium is None:
+        return False
+
+    try:
+        page = source_pdf_document[page_index]
+        bitmap = page.render(scale=2.0)
+        pil_image = bitmap.to_pil()
+    except Exception:
+        return False
+
+    stream = io.BytesIO()
+    pil_image.save(stream, format="PNG")
+    stream.seek(0)
+    slide.shapes.add_picture(stream, 0, 0, width=ppt_w, height=ppt_h)
+    return True
+
+
+def _is_ppt_like_slide(d_slide) -> bool:
+    text_elements = [element for element in d_slide.elements if element.type == "text" and getattr(element, "content", "").strip()]
+    visual_elements = [element for element in d_slide.elements if element.type in {"image", "table"}]
+    short_text_count = sum(1 for element in text_elements if len(getattr(element, "content", "").strip()) <= 80)
+    snapshot_ratio = _snapshot_area_ratio(d_slide)
+    return (
+        len(visual_elements) >= 1 and snapshot_ratio >= 0.55 and len(d_slide.elements) <= 8 and len(text_elements) <= 4
+    ) or (
+        len(visual_elements) == 1 and snapshot_ratio >= 0.7 and len(text_elements) <= 3
+    ) or (
+        len(visual_elements) >= 1 and snapshot_ratio >= 0.6 and len(text_elements) <= 5 and short_text_count >= max(1, len(text_elements) - 1)
+    )
+
+
+def _render_title_overlays_only(slide, d_slide, pdf_w: float, pdf_h: float, ppt_w: int, ppt_h: int, is_cover_slide: bool) -> None:
+    title_elements = [
+        element
+        for element in _sorted_elements_for_render(d_slide)
+        if element.type == "text" and getattr(element, "semantic_role", None) in {"title", "subtitle"}
+    ]
+    for element in title_elements[:3]:
+        for overlay_elem in _iter_text_overlay_units(element):
+            if not overlay_elem.bbox:
+                continue
+            left, top, width, height = _element_geometry(overlay_elem, pdf_w, pdf_h, ppt_w, ppt_h)
+            _render_text_element(slide, overlay_elem, left, top, width, height, is_cover_slide)
+
+
+def _render_ppt_like_fidelity(slide, d_slide, pdf_w: float, pdf_h: float, ppt_w: int, ppt_h: int, is_cover_slide: bool, image_size_cache: dict[str, tuple[int, int]]) -> bool:
+    if not _is_ppt_like_slide(d_slide):
+        return False
+    if not _render_page_snapshot(slide, d_slide, ppt_w, ppt_h, is_cover_slide, image_size_cache):
+        return False
+    _render_text_elements_only(slide, d_slide, pdf_w, pdf_h, ppt_w, ppt_h, is_cover_slide)
+    return True
+
+
+def _render_generic_archetype(slide, d_slide, pdf_w: float, pdf_h: float, ppt_w: int, ppt_h: int, is_cover_slide: bool, image_size_cache: dict[str, tuple[int, int]], source_pdf_document=None) -> None:
+    page_index = _slide_page_index(d_slide)
+    page_image_cache: dict[int, Image.Image] = {}
     for elem in _sorted_elements_for_render(d_slide):
         if not elem.bbox:
             continue
-        left, top, width, height = _element_geometry(elem, pdf_w, pdf_h, ppt_w, ppt_h)
         if elem.type == "text":
-            _render_text_element(slide, elem, left, top, width, height, is_cover_slide)
+            for overlay_elem in _iter_text_overlay_units(elem):
+                if not overlay_elem.bbox:
+                    continue
+                left, top, width, height = _element_geometry(overlay_elem, pdf_w, pdf_h, ppt_w, ppt_h)
+                _render_text_element(slide, overlay_elem, left, top, width, height, is_cover_slide)
         elif elem.type in {"image", "table"}:
-            _render_picture_element(slide, elem, left, top, width, height)
+            left, top, width, height = _element_geometry(elem, pdf_w, pdf_h, ppt_w, ppt_h)
+            _render_picture_element(
+                slide,
+                elem,
+                left,
+                top,
+                width,
+                height,
+                image_size_cache,
+                None if source_pdf_document is None else source_pdf_document,
+                page_index,
+                pdf_w,
+                pdf_h,
+                page_image_cache,
+            )
 
 
-def _render_cover_split(slide, d_slide, pdf_w: float, pdf_h: float, ppt_w: int, ppt_h: int) -> None:
-    _render_generic_archetype(slide, d_slide, pdf_w, pdf_h, ppt_w, ppt_h, True)
+def _render_cover_split(slide, d_slide, pdf_w: float, pdf_h: float, ppt_w: int, ppt_h: int, image_size_cache: dict[str, tuple[int, int]]) -> None:
+    _render_generic_archetype(slide, d_slide, pdf_w, pdf_h, ppt_w, ppt_h, True, image_size_cache, None)
 
 
-def _render_roadmap_overview(slide, d_slide, pdf_w: float, pdf_h: float, ppt_w: int, ppt_h: int, is_cover_slide: bool) -> None:
-    _render_generic_archetype(slide, d_slide, pdf_w, pdf_h, ppt_w, ppt_h, is_cover_slide)
+def _render_roadmap_overview(slide, d_slide, pdf_w: float, pdf_h: float, ppt_w: int, ppt_h: int, is_cover_slide: bool, image_size_cache: dict[str, tuple[int, int]]) -> None:
+    _render_generic_archetype(slide, d_slide, pdf_w, pdf_h, ppt_w, ppt_h, is_cover_slide, image_size_cache, None)
 
 
-def _render_two_column_compare(slide, d_slide, pdf_w: float, pdf_h: float, ppt_w: int, ppt_h: int, is_cover_slide: bool) -> None:
-    _render_generic_archetype(slide, d_slide, pdf_w, pdf_h, ppt_w, ppt_h, is_cover_slide)
+def _render_two_column_compare(slide, d_slide, pdf_w: float, pdf_h: float, ppt_w: int, ppt_h: int, is_cover_slide: bool, image_size_cache: dict[str, tuple[int, int]]) -> None:
+    _render_generic_archetype(slide, d_slide, pdf_w, pdf_h, ppt_w, ppt_h, is_cover_slide, image_size_cache, None)
 
 
-def _render_policy_text_heavy(slide, d_slide, pdf_w: float, pdf_h: float, ppt_w: int, ppt_h: int, is_cover_slide: bool) -> None:
-    _render_generic_archetype(slide, d_slide, pdf_w, pdf_h, ppt_w, ppt_h, is_cover_slide)
+def _render_policy_text_heavy(slide, d_slide, pdf_w: float, pdf_h: float, ppt_w: int, ppt_h: int, is_cover_slide: bool, image_size_cache: dict[str, tuple[int, int]]) -> None:
+    _render_generic_archetype(slide, d_slide, pdf_w, pdf_h, ppt_w, ppt_h, is_cover_slide, image_size_cache, None)
 
 
-def _render_closing_statement(slide, d_slide, pdf_w: float, pdf_h: float, ppt_w: int, ppt_h: int, is_cover_slide: bool) -> None:
-    _render_generic_archetype(slide, d_slide, pdf_w, pdf_h, ppt_w, ppt_h, is_cover_slide)
+def _render_closing_statement(slide, d_slide, pdf_w: float, pdf_h: float, ppt_w: int, ppt_h: int, is_cover_slide: bool, image_size_cache: dict[str, tuple[int, int]]) -> None:
+    _render_generic_archetype(slide, d_slide, pdf_w, pdf_h, ppt_w, ppt_h, is_cover_slide, image_size_cache, None)
 
 
-def _render_slide_by_archetype(slide, d_slide, pdf_w: float, pdf_h: float, ppt_w: int, ppt_h: int, is_cover_slide: bool) -> None:
-    archetype = getattr(d_slide, "archetype", "single_visual_explainer")
-    if archetype == "cover_split":
-        _render_cover_split(slide, d_slide, pdf_w, pdf_h, ppt_w, ppt_h)
-        return
-    if archetype == "roadmap_overview":
-        _render_roadmap_overview(slide, d_slide, pdf_w, pdf_h, ppt_w, ppt_h, is_cover_slide)
-        return
-    if archetype == "two_column_compare":
-        _render_two_column_compare(slide, d_slide, pdf_w, pdf_h, ppt_w, ppt_h, is_cover_slide)
-        return
-    if archetype == "policy_text_heavy":
-        _render_policy_text_heavy(slide, d_slide, pdf_w, pdf_h, ppt_w, ppt_h, is_cover_slide)
-        return
-    if archetype == "closing_statement":
-        _render_closing_statement(slide, d_slide, pdf_w, pdf_h, ppt_w, ppt_h, is_cover_slide)
-        return
-    _render_generic_archetype(slide, d_slide, pdf_w, pdf_h, ppt_w, ppt_h, is_cover_slide)
+def _render_slide_by_archetype(
+    slide,
+    d_slide,
+    pdf_w: float,
+    pdf_h: float,
+    ppt_w: int,
+    ppt_h: int,
+    is_cover_slide: bool,
+    render_mode: str,
+    image_size_cache: dict[str, tuple[int, int]],
+    source_pdf_document=None,
+) -> None:
+    _render_generic_archetype(slide, d_slide, pdf_w, pdf_h, ppt_w, ppt_h, is_cover_slide, image_size_cache, source_pdf_document)
 
 
-def _add_picture_cover(slide, img_path: str, left: int, top: int, width: int, height: int) -> None:
+def _get_image_size(img_path: str, image_size_cache: dict[str, tuple[int, int]]) -> tuple[int, int]:
+    cached = image_size_cache.get(img_path)
+    if cached:
+        return cached
+
     with Image.open(img_path) as image:
-        image_width, image_height = image.size
+        size = image.size
+
+    image_size_cache[img_path] = size
+    return size
+
+
+def _add_picture_cover(slide, img_path: str, left: int, top: int, width: int, height: int, image_size_cache: dict[str, tuple[int, int]]) -> None:
+    image_width, image_height = _get_image_size(img_path, image_size_cache)
 
     if image_width <= 0 or image_height <= 0:
         slide.shapes.add_picture(img_path, left, top, width=width, height=height)
@@ -270,11 +563,24 @@ def _add_picture_cover(slide, img_path: str, left: int, top: int, width: int, he
         picture.crop_right = 0
 
 
-def generate_pptx(presentation: DomainPresentation, template_key: str = "default", request_id: str | None = None) -> str:
+def generate_pptx(
+    presentation: DomainPresentation,
+    template_key: str = "default",
+    request_id: str | None = None,
+    render_mode_overrides: dict[int, str] | None = None,
+    source_pdf_path: str | None = None,
+) -> str:
     """
     Convert Domain Presentation to PPTX file.
     Returns path to the generated file.
     """
+    overrides = render_mode_overrides or {}
+    image_size_cache: dict[str, tuple[int, int]] = {}
+    source_pdf_document = None
+    if source_pdf_path and pdfium is not None:
+        source_path = Path(source_pdf_path)
+        if source_path.exists():
+            source_pdf_document = pdfium.PdfDocument(str(source_path))
 
     prs = _build_base_presentation(presentation)
     profile = _effective_style_profile(presentation)
@@ -319,7 +625,19 @@ def generate_pptx(presentation: DomainPresentation, template_key: str = "default
         # We'll use a safer approach: Place elements relative to slide size using %
         # bbox is usually [x0, y0, x1, y1]
 
-        _render_slide_by_archetype(slide, d_slide, pdf_w, pdf_h, ppt_w, ppt_h, is_cover_slide)
+        render_mode = overrides.get(d_slide.page_id) or getattr(d_slide, "render_mode", None) or "auto"
+        _render_slide_by_archetype(
+            slide,
+            d_slide,
+            pdf_w,
+            pdf_h,
+            ppt_w,
+            ppt_h,
+            is_cover_slide,
+            render_mode,
+            image_size_cache,
+            source_pdf_document,
+        )
 
     # Save output
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
