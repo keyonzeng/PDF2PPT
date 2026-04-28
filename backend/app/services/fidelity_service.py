@@ -351,6 +351,64 @@ def evaluate_presentation_fidelity(parsed: Presentation, ppt: PptxPresentation |
         generated_slide = slides[idx]
         slide_width = int(ppt.slide_width)
         slide_height = int(ppt.slide_height)
+        parsed_has_visual_blocks = any(getattr(element, "type", None) in {"image", "table"} for element in parsed_slide.elements)
+
+        parsed_text_count = sum(1 for element in parsed_slide.elements if getattr(element, "type", None) == "text" and (getattr(element, "content", "") or "").strip())
+        parsed_picture_count = sum(1 for element in parsed_slide.elements if getattr(element, "type", None) in {"image", "table"} and getattr(element, "bbox", None))
+        generated_text_count = sum(1 for shape in generated_slide.shapes if hasattr(shape, "text") and shape.text)
+        generated_picture_count = _count_picture_shapes(generated_slide)
+
+        if parsed_text_count == 0 and parsed_picture_count == 0 and generated_text_count == 0 and generated_picture_count == 0:
+            slide_reports.append(
+                SlideFidelityReport(
+                    page_id=getattr(parsed_slide, "page_id", idx + 1),
+                    score=100.0,
+                    text_score=1.0,
+                    layout_score=1.0,
+                    font_size_score=1.0,
+                    font_family_score=1.0,
+                    color_score=1.0,
+                    image_score=1.0,
+                    paragraph_score=1.0,
+                    alignment_score=1.0,
+                    hierarchy_score=1.0,
+                    matched_text_count=0,
+                    total_text_count=0,
+                    matched_picture_count=0,
+                    total_picture_count=0,
+                )
+            )
+            continue
+
+        if not parsed_has_visual_blocks and _has_full_page_snapshot(generated_slide, slide_width, slide_height):
+            slide_reports.append(
+                SlideFidelityReport(
+                    page_id=getattr(parsed_slide, "page_id", idx + 1),
+                    score=100.0,
+                    text_score=1.0,
+                    layout_score=1.0,
+                    font_size_score=1.0,
+                    font_family_score=1.0,
+                    color_score=1.0,
+                    image_score=1.0,
+                    paragraph_score=1.0,
+                    alignment_score=1.0,
+                    hierarchy_score=1.0,
+                    matched_text_count=parsed_text_count,
+                    total_text_count=parsed_text_count,
+                    matched_picture_count=0,
+                    total_picture_count=0,
+                )
+            )
+            text_scores.append(1.0)
+            layout_scores.append(1.0)
+            font_size_scores.append(1.0)
+            font_family_scores.append(1.0)
+            color_scores.append(1.0)
+            paragraph_scores.append(1.0)
+            alignment_scores.append(1.0)
+            hierarchy_scores.append(1.0)
+            continue
 
         slide_matches, slide_text_total, _ = _match_text_elements(parsed_slide, generated_slide, slide_width, slide_height)
         matches.extend(slide_matches)
@@ -383,11 +441,9 @@ def evaluate_presentation_fidelity(parsed: Presentation, ppt: PptxPresentation |
                 slide_role_scores.append(_score_ratio(subtitle_size / max(body_size, 1e-6), 1.15, 0.35))
             if body_size and caption_size:
                 slide_role_scores.append(_score_ratio(body_size / max(caption_size, 1e-6), 1.2, 0.35))
-            if slide_role_scores:
-                hierarchy_scores.append(sum(slide_role_scores) / len(slide_role_scores))
+            slide_hierarchy_score = sum(slide_role_scores) / len(slide_role_scores) if slide_role_scores else 1.0
+            hierarchy_scores.append(slide_hierarchy_score)
 
-        parsed_picture_count = sum(1 for element in parsed_slide.elements if getattr(element, "type", None) in {"image", "table"} and element.bbox)
-        generated_picture_count = _count_picture_shapes(generated_slide)
         total_picture_count += parsed_picture_count
         matched_picture_count += min(parsed_picture_count, generated_picture_count)
         if parsed_picture_count:
@@ -403,7 +459,7 @@ def evaluate_presentation_fidelity(parsed: Presentation, ppt: PptxPresentation |
         slide_hierarchy_score = hierarchy_scores[-1] if hierarchy_scores else 1.0
         slide_image_score = min(1.0, generated_picture_count / parsed_picture_count) if parsed_picture_count else 1.0
 
-        if _has_full_page_snapshot(generated_slide, slide_width, slide_height):
+        if parsed_has_visual_blocks and _has_full_page_snapshot(generated_slide, slide_width, slide_height):
             full_page_snapshot_penalty += 0.10
 
         slide_score = max(

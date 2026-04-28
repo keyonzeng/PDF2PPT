@@ -100,12 +100,33 @@ def _set_run_font_name(run, font_name: str) -> None:
         font.set("typeface", font_name)
 
 
+def _apply_run_inline_styles(run, elem: TextElement) -> None:
+    italic = getattr(elem, "italic", None)
+    underline = getattr(elem, "underline", None)
+    strikethrough = getattr(elem, "strikethrough", None)
+
+    if italic is not None:
+        run.font.italic = bool(italic)
+    if underline is not None:
+        run.font.underline = bool(underline)
+    if strikethrough is not None:
+        r_pr = run._r.get_or_add_rPr()
+        if bool(strikethrough):
+            r_pr.set("strike", "sngStrike")
+        else:
+            r_pr.attrib.pop("strike", None)
+
+
 def _infer_font_name(text: str, preferred: str | None = None) -> str:
     if preferred:
         return preferred
     if any("\u4e00" <= ch <= "\u9fff" for ch in text):
         return "Microsoft YaHei"
     return "Arial"
+
+
+def _normalized_text(value: str | None) -> str:
+    return " ".join((value or "").split())
 
 
 def _box_height_points(textbox) -> float:
@@ -133,8 +154,6 @@ def _paragraph_font_size_pt(textbox, elem: TextElement, paragraph_index: int, fa
 
 def _should_word_wrap_text(elem: TextElement, content: str, line_texts: list[str]) -> bool:
     role = getattr(elem, "semantic_role", None)
-    if len(line_texts) > 1:
-        return False
     if role in {"body", "subtitle", "caption"} and len(content) >= 18:
         return True
     return False
@@ -162,17 +181,19 @@ def _apply_text_style(textbox, elem: TextElement, is_cover_slide: bool) -> None:
         paragraph.space_after = Pt(0)
 
         if is_cover_slide and role == "title":
-            run.font.size = Pt(_paragraph_font_size_pt(textbox, elem, paragraph_index, 30))
+            run.font.size = Pt(_paragraph_font_size_pt(textbox, elem, paragraph_index, 30) * 0.9)
             is_split_parenthetical_line = (paragraph_index > 0 and (paragraph.text or "").strip().startswith(("（", "("))) or content.startswith(("（", "("))
             run.font.bold = False if is_split_parenthetical_line else True
             run.font.color.rgb = subtitle_color if is_split_parenthetical_line else accent_color
             _set_run_font_name(run, _infer_font_name(content, getattr(elem, "font_name", None) or getattr(getattr(profile, "title_style", None), "font_name", None) or resolved_font_name))
+            _apply_run_inline_styles(run, elem)
             paragraph.alignment = _alignment_value(getattr(elem, "align", None) or "left")
         elif is_cover_slide and role in {"subtitle", "body"} and len(content) <= 40:
-            run.font.size = Pt(_paragraph_font_size_pt(textbox, elem, paragraph_index, 18))
+            run.font.size = Pt(_paragraph_font_size_pt(textbox, elem, paragraph_index, 18) * 0.9)
             run.font.bold = bool(getattr(elem, "bold", None))
             run.font.color.rgb = subtitle_color
             _set_run_font_name(run, _infer_font_name(content, getattr(elem, "font_name", None) or getattr(getattr(profile, "subtitle_style", None), "font_name", None) or resolved_font_name))
+            _apply_run_inline_styles(run, elem)
             paragraph.alignment = _alignment_value(getattr(elem, "align", None) or "left")
         elif role == "title":
             run.font.size = Pt(_paragraph_font_size_pt(textbox, elem, paragraph_index, getattr(getattr(profile, "title_style", None), "font_size", 24) or 24))
@@ -180,34 +201,51 @@ def _apply_text_style(textbox, elem: TextElement, is_cover_slide: bool) -> None:
             run.font.bold = False if is_split_parenthetical_line else (True if getattr(elem, "bold", None) is None else bool(getattr(elem, "bold", None)))
             run.font.color.rgb = subtitle_color if is_split_parenthetical_line else title_color
             _set_run_font_name(run, _infer_font_name(content, getattr(elem, "font_name", None) or getattr(getattr(profile, "title_style", None), "font_name", None) or resolved_font_name))
+            _apply_run_inline_styles(run, elem)
             paragraph.alignment = _alignment_value(getattr(elem, "align", None) or getattr(getattr(profile, "title_style", None), "align", "left"))
         elif role == "subtitle":
             run.font.size = Pt(_paragraph_font_size_pt(textbox, elem, paragraph_index, getattr(getattr(profile, "subtitle_style", None), "font_size", 18) or 18))
             run.font.bold = bool(getattr(elem, "bold", None))
             run.font.color.rgb = subtitle_color
             _set_run_font_name(run, _infer_font_name(content, getattr(elem, "font_name", None) or getattr(getattr(profile, "subtitle_style", None), "font_name", None) or resolved_font_name))
+            _apply_run_inline_styles(run, elem)
             paragraph.alignment = _alignment_value(getattr(elem, "align", None) or getattr(getattr(profile, "subtitle_style", None), "align", "left"))
         elif role == "caption":
             run.font.size = Pt(_paragraph_font_size_pt(textbox, elem, paragraph_index, getattr(getattr(profile, "caption_style", None), "font_size", 12) or 12))
             run.font.bold = bool(getattr(elem, "bold", None))
             run.font.color.rgb = subtitle_color
             _set_run_font_name(run, _infer_font_name(content, getattr(elem, "font_name", None) or getattr(getattr(profile, "caption_style", None), "font_name", None) or resolved_font_name))
+            _apply_run_inline_styles(run, elem)
             paragraph.alignment = _alignment_value(getattr(elem, "align", None) or getattr(getattr(profile, "caption_style", None), "align", "left"))
         else:
             run.font.size = Pt(_paragraph_font_size_pt(textbox, elem, paragraph_index, getattr(getattr(profile, "body_style", None), "font_size", 16) or 16))
             run.font.bold = bool(getattr(elem, "bold", None))
             run.font.color.rgb = title_color
             _set_run_font_name(run, resolved_font_name)
+            _apply_run_inline_styles(run, elem)
+
+        if archetype == "single_visual_explainer" and role == "title" and run.font.size is not None:
+            run.font.size = Pt(max(float(run.font.size.pt) * 0.92, 10.0))
+        if archetype == "single_visual_explainer" and role in {"subtitle", "body", "caption"} and run.font.size is not None:
+            run.font.size = Pt(max(float(run.font.size.pt) * 0.93, 8.0))
 
         if archetype == "infographic_node_map" and role == "caption":
             run.font.size = Pt(11)
             paragraph.alignment = PP_ALIGN.CENTER
+        if archetype == "infographic_node_map" and role in {"subtitle", "body", "caption"} and run.font.size is not None:
+            run.font.size = Pt(max(float(run.font.size.pt) * 0.85, 8.0))
         if archetype == "policy_text_heavy" and role == "title":
             run.font.size = Pt(26)
 
+        if len(text_frame.paragraphs) > 1:
+            if role == "title":
+                paragraph.space_after = Pt(max(float(run.font.size.pt) * 0.22, 2.0))
+            elif role in {"subtitle", "body", "caption"}:
+                paragraph.space_after = Pt(max(float(run.font.size.pt) * 0.10, 1.0))
+
         font_size = run.font.size
         if font_size is not None:
-            paragraph.line_spacing = Pt(max(float(font_size.pt) * 1.0, 1.0))
+            paragraph.line_spacing = Pt(max(float(font_size.pt) * 1.15, 1.0))
 
 
 def _apply_archetype_layout_hints(slide, d_slide, profile: DocumentStyleProfile) -> None:
@@ -228,14 +266,21 @@ def _element_geometry(elem, pdf_w: float, pdf_h: float, ppt_w: int, ppt_h: int) 
     x0, y0, x1, y1 = elem.bbox
     w = x1 - x0
     h = y1 - y0
-    rel_x = x0 / pdf_w
-    rel_y = y0 / pdf_h
-    rel_w = w / pdf_w
-    rel_h = h / pdf_h
-    left = int(rel_x * ppt_w)
-    top = int(rel_y * ppt_h)
-    width = int(rel_w * ppt_w)
-    height = int(rel_h * ppt_h)
+    safe_pdf_w = max(float(pdf_w), 1.0)
+    safe_pdf_h = max(float(pdf_h), 1.0)
+    safe_ppt_w = max(int(ppt_w), 1)
+    safe_ppt_h = max(int(ppt_h), 1)
+
+    scale = min(safe_ppt_w / safe_pdf_w, safe_ppt_h / safe_pdf_h)
+    scaled_page_w = safe_pdf_w * scale
+    scaled_page_h = safe_pdf_h * scale
+    offset_x = max((safe_ppt_w - scaled_page_w) / 2.0, 0.0)
+    offset_y = max((safe_ppt_h - scaled_page_h) / 2.0, 0.0)
+
+    left = int(round(offset_x + (x0 * scale)))
+    top = int(round(offset_y + (y0 * scale)))
+    width = max(int(round(w * scale)), 1)
+    height = max(int(round(h * scale)), 1)
     return left, top, width, height
 
 
@@ -249,15 +294,19 @@ def _render_text_element(slide, elem, left: int, top: int, width: int, height: i
     textbox.fill.background()
     textbox.line.fill.background()
     tf = textbox.text_frame
+    role = getattr(elem, "semantic_role", None)
     tf.vertical_anchor = MSO_ANCHOR.TOP
-    tf.auto_size = MSO_AUTO_SIZE.NONE
+    archetype = getattr(slide, "_pdf2ppt_archetype", "single_visual_explainer")
+    tf.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE if role in {"body", "caption"} or (archetype == "infographic_node_map" and role == "subtitle") else MSO_AUTO_SIZE.NONE
     tf.margin_left = 0
     tf.margin_right = 0
     tf.margin_top = 0
     tf.margin_bottom = 0
     line_texts = [line for line in (getattr(elem, "line_texts", None) or []) if line.strip()]
-    role = getattr(elem, "semantic_role", None)
-    should_render_lines_as_paragraphs = len(line_texts) > 1
+    content_text = (elem.content or "").replace("\n", "\v")
+    normalized_content = _normalized_text(content_text.replace("\v", "\n"))
+    normalized_line_texts = _normalized_text("\n".join(line_texts)) if line_texts else ""
+    should_render_lines_as_paragraphs = len(line_texts) > 1 and normalized_line_texts == normalized_content and role in {"title", "subtitle"}
     if should_render_lines_as_paragraphs:
         first_paragraph = tf.paragraphs[0]
         first_paragraph.text = line_texts[0]
@@ -265,7 +314,7 @@ def _render_text_element(slide, elem, left: int, top: int, width: int, height: i
             paragraph = tf.add_paragraph()
             paragraph.text = line_text
     else:
-        tf.text = (elem.content or "").replace("\n", "\v")
+        tf.text = content_text
     tf.word_wrap = _should_word_wrap_text(elem, elem.content or "", line_texts)
     _apply_text_style(textbox, elem, is_cover_slide)
 
@@ -296,7 +345,7 @@ def _render_page_image(source_pdf_document, page_index: int, page_image_cache: d
 
     try:
         page = source_pdf_document[page_index]
-        bitmap = page.render(scale=2.0)
+        bitmap = page.render(scale=8.0)
         pil_image = bitmap.to_pil()
     except Exception:
         return None
@@ -412,7 +461,7 @@ def _render_pdf_page_snapshot(slide, source_pdf_document, page_index: int, ppt_w
 
     try:
         page = source_pdf_document[page_index]
-        bitmap = page.render(scale=2.0)
+        bitmap = page.render(scale=8.0)
         pil_image = bitmap.to_pil()
     except Exception:
         return False
@@ -424,18 +473,8 @@ def _render_pdf_page_snapshot(slide, source_pdf_document, page_index: int, ppt_w
     return True
 
 
-def _is_ppt_like_slide(d_slide) -> bool:
-    text_elements = [element for element in d_slide.elements if element.type == "text" and getattr(element, "content", "").strip()]
-    visual_elements = [element for element in d_slide.elements if element.type in {"image", "table"}]
-    short_text_count = sum(1 for element in text_elements if len(getattr(element, "content", "").strip()) <= 80)
-    snapshot_ratio = _snapshot_area_ratio(d_slide)
-    return (
-        len(visual_elements) >= 1 and snapshot_ratio >= 0.55 and len(d_slide.elements) <= 8 and len(text_elements) <= 4
-    ) or (
-        len(visual_elements) == 1 and snapshot_ratio >= 0.7 and len(text_elements) <= 3
-    ) or (
-        len(visual_elements) >= 1 and snapshot_ratio >= 0.6 and len(text_elements) <= 5 and short_text_count >= max(1, len(text_elements) - 1)
-    )
+def _is_ppt_like_slide(d_slide, render_mode: str, source_pdf_document) -> bool:
+    return False
 
 
 def _render_title_overlays_only(slide, d_slide, pdf_w: float, pdf_h: float, ppt_w: int, ppt_h: int, is_cover_slide: bool) -> None:
@@ -452,8 +491,9 @@ def _render_title_overlays_only(slide, d_slide, pdf_w: float, pdf_h: float, ppt_
             _render_text_element(slide, overlay_elem, left, top, width, height, is_cover_slide)
 
 
-def _render_ppt_like_fidelity(slide, d_slide, pdf_w: float, pdf_h: float, ppt_w: int, ppt_h: int, is_cover_slide: bool, image_size_cache: dict[str, tuple[int, int]]) -> bool:
-    if not _is_ppt_like_slide(d_slide):
+def _render_ppt_like_fidelity(slide, d_slide, pdf_w: float, pdf_h: float, ppt_w: int, ppt_h: int, is_cover_slide: bool, image_size_cache: dict[str, tuple[int, int]], source_pdf_document=None) -> bool:
+    render_mode = getattr(d_slide, "render_mode", "auto")
+    if not _is_ppt_like_slide(d_slide, render_mode, source_pdf_document):
         return False
     if not _render_page_snapshot(slide, d_slide, ppt_w, ppt_h, is_cover_slide, image_size_cache):
         return False
@@ -523,6 +563,21 @@ def _render_slide_by_archetype(
     image_size_cache: dict[str, tuple[int, int]],
     source_pdf_document=None,
 ) -> None:
+    page_index = _slide_page_index(d_slide)
+    text_elements = [element for element in d_slide.elements if element.type == "text" and getattr(element, "content", "").strip()]
+    visual_elements = [element for element in d_slide.elements if element.type in {"image", "table"}]
+
+    if render_mode in {"image_fallback", "hybrid_overlay"} and source_pdf_document is not None:
+        if _render_pdf_page_snapshot(slide, source_pdf_document, page_index, ppt_w, ppt_h):
+            return
+
+    if render_mode == "editable":
+        _render_generic_archetype(slide, d_slide, pdf_w, pdf_h, ppt_w, ppt_h, is_cover_slide, image_size_cache, source_pdf_document)
+        return
+
+    if _render_ppt_like_fidelity(slide, d_slide, pdf_w, pdf_h, ppt_w, ppt_h, is_cover_slide, image_size_cache):
+        return
+
     _render_generic_archetype(slide, d_slide, pdf_w, pdf_h, ppt_w, ppt_h, is_cover_slide, image_size_cache, source_pdf_document)
 
 

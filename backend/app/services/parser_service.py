@@ -1,4 +1,5 @@
 import json
+import statistics
 from pathlib import Path
 from typing import Dict, Any, Optional
 from app.core.models import Presentation, Slide, TextElement, ImageElement, TableElement, Element, DocumentStyleProfile, StyleToken
@@ -108,6 +109,37 @@ def _extract_line_bboxes_from_middle_block(block: Dict[str, Any]) -> list[list[f
     return line_bboxes
 
 
+def _extract_block_bbox_from_middle_block(block: Dict[str, Any]) -> Optional[list[float]]:
+    bbox_fs = block.get("bbox_fs") or []
+    if len(bbox_fs) == 4:
+        return [float(bbox_fs[0]), float(bbox_fs[1]), float(bbox_fs[2]), float(bbox_fs[3])]
+
+    bbox = block.get("bbox") or []
+    if len(bbox) == 4:
+        return [float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])]
+
+    line_bboxes = _extract_line_bboxes_from_middle_block(block)
+    if not line_bboxes:
+        return None
+
+    x0 = min(line_bbox[0] for line_bbox in line_bboxes)
+    y0 = min(line_bbox[1] for line_bbox in line_bboxes)
+    x1 = max(line_bbox[2] for line_bbox in line_bboxes)
+    y1 = max(line_bbox[3] for line_bbox in line_bboxes)
+    return [float(x0), float(y0), float(x1), float(y1)]
+
+
+def _union_bboxes(*boxes: list[float] | None) -> Optional[list[float]]:
+    valid_boxes = [box for box in boxes if box and len(box) == 4]
+    if not valid_boxes:
+        return None
+    x0 = min(float(box[0]) for box in valid_boxes)
+    y0 = min(float(box[1]) for box in valid_boxes)
+    x1 = max(float(box[2]) for box in valid_boxes)
+    y1 = max(float(box[3]) for box in valid_boxes)
+    return [float(x0), float(y0), float(x1), float(y1)]
+
+
 def _extract_text_style_from_middle_block(block: Dict[str, Any]) -> Dict[str, Any]:
     style: Dict[str, Any] = {}
     for line in block.get("lines", []):
@@ -120,6 +152,15 @@ def _extract_text_style_from_middle_block(block: Dict[str, Any]) -> Dict[str, An
                     if value:
                         style["font_name"] = str(value)
                         break
+            if "font_size" not in style:
+                for key in ("font_size", "size", "fontSize", "font_sz"):
+                    value = span.get(key)
+                    if value is not None:
+                        try:
+                            style["font_size"] = float(value)
+                            break
+                        except (TypeError, ValueError):
+                            continue
             if not style.get("color"):
                 for key in ("color", "font_color", "text_color"):
                     value = span.get(key)
@@ -132,19 +173,57 @@ def _extract_text_style_from_middle_block(block: Dict[str, Any]) -> Dict[str, An
                     if value is not None:
                         style["bold"] = bool(value)
                         break
+            if "italic" not in style:
+                for key in ("italic", "is_italic"):
+                    value = span.get(key)
+                    if value is not None:
+                        style["italic"] = bool(value)
+                        break
+            if "underline" not in style:
+                for key in ("underline", "is_underline"):
+                    value = span.get(key)
+                    if value is not None:
+                        style["underline"] = bool(value)
+                        break
+            if "strikethrough" not in style:
+                for key in ("strikethrough", "strike", "is_strikethrough", "is_strike"):
+                    value = span.get(key)
+                    if value is not None:
+                        style["strikethrough"] = bool(value)
+                        break
         if style:
             break
     return style
 
 
-def _infer_text_alignment(block: Dict[str, Any], page_width: float, page_height: float | None = None) -> str:
-    bbox = block.get("bbox") or []
+def _extract_explicit_font_sizes_from_middle_block(block: Dict[str, Any]) -> list[float]:
+    font_sizes: list[float] = []
+    for line in block.get("lines", []):
+        for span in line.get("spans", []):
+            if not isinstance(span, dict):
+                continue
+            for key in ("font_size", "size", "fontSize", "font_sz"):
+                value = span.get(key)
+                if value is None:
+                    continue
+                try:
+                    font_sizes.append(float(value))
+                    break
+                except (TypeError, ValueError):
+                    continue
+    return font_sizes
+
+
+def _infer_text_alignment(
+    block: Dict[str, Any],
+    page_width: float,
+    page_height: float | None = None,
+    line_bboxes: list[list[float]] | None = None,
+) -> str:
+    bbox = _extract_block_bbox_from_middle_block(block) or block.get("bbox") or []
     if len(bbox) != 4 or not page_width:
         return "left"
     x0, _, x1, _ = [float(value) for value in bbox]
-    left_margin = x0 / page_width
-    right_margin = max(page_width - x1, 0.0) / page_width
-    center_x = ((x0 + x1) / 2) / page_width
     width_ratio = max((x1 - x0) / page_width, 0.0)
     top_ratio = 0.0
     if page_height:
@@ -152,72 +231,179 @@ def _infer_text_alignment(block: Dict[str, Any], page_width: float, page_height:
     content = _extract_text_from_middle_block(block)
     content_length = len(content.strip())
 
+    block_width = max(x1 - x0, 1.0)
+    block_center_x = (x0 + x1) / 2.0
+
     if content_length <= 8 and any(ch.isdigit() for ch in content):
-        if right_margin < left_margin * 0.8:
+        if x1 / page_width > 0.85 and x0 / page_width > 0.45:
             return "right"
-        if left_margin < right_margin * 0.8:
+        if x0 / page_width < 0.2:
             return "left"
         return "center"
 
     if top_ratio < 0.22 and width_ratio > 0.45 and content_length > 8:
         return "center"
 
-    if top_ratio > 0.55 and width_ratio > 0.25 and content_length > 12:
-        return "center"
+    if line_bboxes:
+        valid_line_boxes = [line_bbox for line_bbox in line_bboxes if len(line_bbox) == 4]
+        if valid_line_boxes:
+            line_left = min(float(line_bbox[0]) for line_bbox in valid_line_boxes)
+            line_right = max(float(line_bbox[2]) for line_bbox in valid_line_boxes)
+            line_width_ratio = max((line_right - line_left) / block_width, 0.0)
+            left_pad_ratio = max((line_left - x0) / block_width, 0.0)
+            right_pad_ratio = max((x1 - line_right) / block_width, 0.0)
+            line_center_delta = abs(((line_left + line_right) / 2.0) - block_center_x) / block_width
+            if line_width_ratio <= 0.55 and line_center_delta <= 0.08 and left_pad_ratio >= 0.12 and right_pad_ratio >= 0.12:
+                return "center"
+            if right_pad_ratio <= 0.08 and left_pad_ratio >= 0.18:
+                return "right"
+            if left_pad_ratio <= 0.08:
+                return "left"
 
-    if abs(center_x - 0.5) <= 0.04 and abs(left_margin - right_margin) <= 0.04 and width_ratio <= 0.45:
-        return "center"
-    if left_margin > 0.45 and right_margin < 0.15:
-        return "right"
     return "left"
 
 
 def _font_size_hint(role: str | None, content: str | None = None) -> tuple[float, float]:
     content_length = len((content or "").strip())
     if role == "title":
-        return 0.48, 34.0
+        return 0.80, 34.0
     if role == "subtitle":
         if content_length <= 8 or ((content or "").strip().isdigit()):
-            return 0.55, 20.0
-        return 0.24, 24.0
+            return 0.72, 20.0
+        return 0.68, 24.0
     if role == "caption":
-        return 0.20, 14.0
-    return 0.28, 20.0
+        return 0.58, 14.0
+    return 0.66, 20.0
+
+
+def _role_font_bounds(role: str | None, content: str | None = None) -> tuple[float, float]:
+    content_length = len((content or "").strip())
+    if role == "title":
+        return (18.0 if content_length <= 42 else 16.0), 34.0
+    if role == "subtitle":
+        if content_length <= 8 or ((content or "").strip().isdigit()):
+            return 16.0, 20.0
+        return 12.0, 24.0
+    if role == "caption":
+        return 8.0, 14.0
+    return 10.0, 20.0
+
+
+def _weighted_character_count(content: str) -> float:
+    weighted_count = 0.0
+    for char in content or "":
+        if char.isspace():
+            continue
+        code_point = ord(char)
+        if 0x4E00 <= code_point <= 0x9FFF or 0x3400 <= code_point <= 0x4DBF or 0xF900 <= code_point <= 0xFAFF:
+            weighted_count += 1.0
+        elif char.isdigit():
+            weighted_count += 0.58
+        elif char.isalpha():
+            weighted_count += 0.56
+        else:
+            weighted_count += 0.35
+    return weighted_count
+
+
+def _estimate_font_size_from_line_bbox(
+    line_bbox: list[float],
+    line_text: str,
+    page_width: float,
+    page_height: float,
+    role: str | None = None,
+) -> Optional[float]:
+    if len(line_bbox) != 4 or not page_height:
+        return None
+
+    line_width = max(float(line_bbox[2]) - float(line_bbox[0]), 0.0)
+    line_height = max(float(line_bbox[3]) - float(line_bbox[1]), 0.0)
+    if line_width <= 0 or line_height <= 0:
+        return None
+
+    content = (line_text or "").strip()
+    scale = 540.0 / max(float(page_height), 1.0)
+    line_width_pt = line_width * scale
+    line_height_pt = line_height * scale
+    height_ratio, cap = _font_size_hint(role, content)
+    floor, role_cap = _role_font_bounds(role, content)
+    cap = min(cap, role_cap)
+
+    height_estimate = line_height_pt * height_ratio
+    weighted_chars = _weighted_character_count(content)
+    if weighted_chars > 0:
+        width_estimate = line_width_pt / max(weighted_chars * 0.95, 1.0)
+        if content and len(content) <= 8 and content.isdigit():
+            width_estimate = min(width_estimate, 20.0)
+    else:
+        width_estimate = height_estimate
+
+    font_size = min(height_estimate, width_estimate * 1.05)
+    return max(min(font_size, cap), floor)
 
 
 def _estimate_middle_font_size(block: Dict[str, Any], page_height: float, role: str | None = None) -> Optional[float]:
     if not page_height:
         return None
-    line_heights: list[float] = []
-    for line in block.get("lines", []):
-        bbox = line.get("bbox") or []
-        if len(bbox) != 4:
-            continue
-        line_heights.append(max(float(bbox[3]) - float(bbox[1]), 0.0))
-    if not line_heights:
+    explicit_font_sizes = _extract_explicit_font_sizes_from_middle_block(block)
+    if explicit_font_sizes:
+        return float(statistics.median(explicit_font_sizes))
+
+    line_font_sizes: list[float] = []
+    line_bboxes = _extract_line_bboxes_from_middle_block(block)
+    line_texts = _extract_line_texts_from_middle_block(block)
+
+    for index, line_bbox in enumerate(line_bboxes):
+        line_text = line_texts[index] if index < len(line_texts) else ""
+        line_font_size = _estimate_font_size_from_line_bbox(line_bbox, line_text, 0.0, page_height, role)
+        if line_font_size is not None:
+            line_font_sizes.append(line_font_size)
+
+    if not line_font_sizes:
+        for line in block.get("lines", []):
+            bbox = line.get("bbox") or []
+            if len(bbox) != 4:
+                continue
+            line_text = " ".join(
+                _collapse_artificial_spaces(str(span.get("content") or "").strip())
+                for span in line.get("spans", [])
+                if isinstance(span, dict) and span.get("content")
+            ).strip()
+            line_font_size = _estimate_font_size_from_line_bbox([float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])], line_text, 0.0, page_height, role)
+            if line_font_size is not None:
+                line_font_sizes.append(line_font_size)
+
+    if not line_font_sizes:
         bbox = block.get("bbox") or []
         if len(bbox) == 4:
-            line_heights.append(max(float(bbox[3]) - float(bbox[1]), 0.0))
-    if not line_heights:
+            content = _extract_text_from_middle_block(block)
+            estimated = _estimate_font_size_from_line_bbox([float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])], content, 0.0, page_height, role)
+            if estimated is not None:
+                return estimated
+
+    if not line_font_sizes:
         return None
-    avg_line_height = sum(line_heights) / len(line_heights)
-    slide_height_points = 540.0
-    content = _extract_text_from_middle_block(block)
-    scale, cap = _font_size_hint(role, content)
-    return max(min((avg_line_height / page_height) * slide_height_points * scale, cap), 8.0)
+    if len(line_font_sizes) == 1:
+        return line_font_sizes[0]
+    return float(statistics.median(line_font_sizes))
 
 
-def _estimate_line_font_sizes(line_bboxes: list[list[float]], page_height: float, role: str | None = None) -> list[float]:
+def _estimate_line_font_sizes(
+    line_bboxes: list[list[float]],
+    line_texts: list[str] | None,
+    page_height: float,
+    role: str | None = None,
+) -> list[float]:
     if not page_height:
         return []
-    slide_height_points = 540.0
-    scale, cap = _font_size_hint(role)
     font_sizes: list[float] = []
-    for bbox in line_bboxes:
+    for index, bbox in enumerate(line_bboxes):
         if len(bbox) != 4:
             continue
-        line_height = max(float(bbox[3]) - float(bbox[1]), 0.0)
-        font_sizes.append(max(min((line_height / page_height) * slide_height_points * scale, cap), 8.0))
+        line_text = line_texts[index] if line_texts and index < len(line_texts) else ""
+        line_font_size = _estimate_font_size_from_line_bbox([float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])], line_text, 0.0, page_height, role)
+        if line_font_size is not None:
+            font_sizes.append(line_font_size)
     return font_sizes
 
 def _extract_image_path_from_middle_block(block: Dict[str, Any]) -> str:
@@ -275,6 +461,11 @@ def _infer_middle_text_role(block: Dict[str, Any], page_width: float, page_heigh
 def _map_middle_block_to_element(block: Dict[str, Any], output_base_path: Path, page_idx: int, page_width: float, page_height: float, archetype: str) -> Optional[Element]:
     block_type = (block.get("type") or "").lower()
     bbox = block.get("bbox")
+    bbox_fs = block.get("bbox_fs")
+    preferred_bbox = _extract_block_bbox_from_middle_block(block)
+    raw_bbox = None
+    if len(bbox or []) == 4:
+        raw_bbox = [float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])]
 
     if block_type in {"title", "text"}:
         line_texts = _extract_line_texts_from_middle_block(block)
@@ -288,21 +479,25 @@ def _map_middle_block_to_element(block: Dict[str, Any], output_base_path: Path, 
         is_short_year_label = archetype == "two_column_compare" and semantic_role == "subtitle" and len(content_stripped) <= 8 and content_stripped.isdigit()
         return TextElement(
             content=content,
-            bbox=bbox,
+            bbox=preferred_bbox or raw_bbox,
             page_id=page_idx,
             text_level=text_level,
             semantic_role=semantic_role,
-            align=_infer_text_alignment(block, page_width, page_height),
+            align=_infer_text_alignment(block, page_width, page_height, line_bboxes=line_bboxes),
             font_size=_estimate_middle_font_size(block, page_height, semantic_role),
             bold=style.get("bold") if style.get("bold") is not None else (block_type == "title" or is_short_year_label),
+            italic=style.get("italic"),
+            underline=style.get("underline"),
+            strikethrough=style.get("strikethrough"),
             color=style.get("color"),
             font_name=style.get("font_name"),
+            bbox_fs=[float(value) for value in bbox_fs] if len(bbox_fs or []) == 4 else None,
             line_texts=line_texts or None,
             line_bboxes=line_bboxes or None,
             line_font_sizes=(
                 [max(float(font_size := _estimate_middle_font_size(block, page_height, semantic_role) or 0.0), 8.0), max((font_size or 0.0) * 0.62, 8.0)]
                 if archetype == "infographic_node_map" and semantic_role == "title" and len(line_texts) == 2 and len(line_bboxes) == 2
-                else _estimate_line_font_sizes(line_bboxes, page_height, semantic_role) or None
+                else _estimate_line_font_sizes(line_bboxes, line_texts, page_height, semantic_role) or None
             ),
         )
 
@@ -314,7 +509,7 @@ def _map_middle_block_to_element(block: Dict[str, Any], output_base_path: Path, 
         return ImageElement(
             content="[IMAGE]",
             path=str(full_img_path),
-            bbox=bbox,
+            bbox=preferred_bbox or raw_bbox,
             page_id=page_idx,
         )
 
@@ -391,6 +586,15 @@ def _merge_text_elements(elements: list[Element], page_width: float, page_height
             merged.append(element.model_copy(deep=True))
             continue
 
+        previous_line_texts = list(getattr(previous, "line_texts", None) or [])
+        current_line_texts = list(getattr(element, "line_texts", None) or [])
+        previous_line_bboxes = list(getattr(previous, "line_bboxes", None) or [])
+        current_line_bboxes = list(getattr(element, "line_bboxes", None) or [])
+        previous_line_font_sizes = list(getattr(previous, "line_font_sizes", None) or [])
+        current_line_font_sizes = list(getattr(element, "line_font_sizes", None) or [])
+        previous_bbox_fs = getattr(previous, "bbox_fs", None)
+        current_bbox_fs = getattr(element, "bbox_fs", None)
+
         previous.content = f"{(previous.content or '').rstrip()} {(element.content or '').lstrip()}".strip()
         previous.bbox = [
             min(prev_bbox[0], curr_bbox[0]),
@@ -398,6 +602,18 @@ def _merge_text_elements(elements: list[Element], page_width: float, page_height
             max(prev_bbox[2], curr_bbox[2]),
             max(prev_bbox[3], curr_bbox[3]),
         ]
+        previous.align = previous.align or element.align
+        if previous.font_size is None:
+            previous.font_size = element.font_size
+        elif element.font_size is not None:
+            previous.font_size = max(float(previous.font_size), float(element.font_size))
+        if previous_line_texts or current_line_texts:
+            previous.line_texts = [*previous_line_texts, *current_line_texts] or None
+        if previous_line_bboxes or current_line_bboxes:
+            previous.line_bboxes = [*previous_line_bboxes, *current_line_bboxes] or None
+        if previous_line_font_sizes or current_line_font_sizes:
+            previous.line_font_sizes = [*previous_line_font_sizes, *current_line_font_sizes] or None
+        previous.bbox_fs = _union_bboxes(previous_bbox_fs, current_bbox_fs)
 
     return [*other_elements, *merged]
 
@@ -407,7 +623,7 @@ def _classify_slide_archetype(blocks: list[Dict[str, Any]], page_idx: int) -> st
     image_count = sum(1 for block in blocks if (block.get("type") or "").lower() == "image")
     list_count = sum(1 for block in blocks if (block.get("type") or "").lower() == "list")
 
-    if page_idx == 0 and image_count == 1 and title_count >= 1:
+    if page_idx == 0 and title_count >= 1 and text_count <= 3 and image_count <= 1:
         return "cover_split"
     if image_count == 1 and text_count >= 10:
         return "roadmap_overview"

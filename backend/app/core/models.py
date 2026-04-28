@@ -11,6 +11,9 @@ class StyleToken(BaseModel):
     font_size: Optional[float] = None
     color: Optional[str] = None
     bold: Optional[bool] = None
+    italic: Optional[bool] = None
+    underline: Optional[bool] = None
+    strikethrough: Optional[bool] = None
     align: Optional[str] = None
     font_name: Optional[str] = None
 
@@ -45,7 +48,11 @@ class TextElement(Element):
     semantic_role: Optional[str] = None
     align: Optional[str] = None
     bold: Optional[bool] = None
+    italic: Optional[bool] = None
+    underline: Optional[bool] = None
+    strikethrough: Optional[bool] = None
     font_name: Optional[str] = None
+    bbox_fs: Optional[List[float]] = None
     line_texts: Optional[List[str]] = None
     line_bboxes: Optional[List[List[float]]] = None
     line_font_sizes: Optional[List[float]] = None

@@ -1,5 +1,5 @@
-from app.services.ppt_gen_service import generate_pptx
-from app.core.models import Presentation, Slide, TextElement
+from app.services.ppt_gen_service import generate_pptx, _element_geometry
+from app.core.models import Presentation, Slide, TextElement, DocumentStyleProfile
 from app.core.models import ImageElement
 from app.main import _presentation_summary
 import os
@@ -111,6 +111,67 @@ def test_generate_pptx_keeps_multiline_body_as_single_paragraph_textbox():
     assert text_shapes
     assert text_shapes[0].text.replace("\v", "\n") == "Body first line\nBody second line"
     assert len(text_shapes[0].text_frame.paragraphs) == 1
+
+
+def test_generate_pptx_uses_contain_transform_for_mismatched_aspect_ratio():
+    presentation = Presentation(
+        style_profile=DocumentStyleProfile(page_width=1200.0, page_height=900.0)
+    )
+    slide = Slide(page_id=1, width=1600.0, height=900.0)
+    slide.add_element(
+        TextElement(
+            content="Mismatch",
+            bbox=[160.0, 90.0, 800.0, 270.0],
+            semantic_role="body",
+        )
+    )
+    presentation.slides.append(slide)
+
+    output_path = Path(generate_pptx(presentation, template_key="default", request_id="test-aspect-mismatch"))
+    ppt = PptxPresentation(str(output_path))
+    text_shapes = [shape for shape in ppt.slides[0].shapes if hasattr(shape, "text") and shape.text]
+
+    assert text_shapes
+    expected_left, expected_top, expected_width, expected_height = _element_geometry(
+        slide.elements[0],
+        slide.width,
+        slide.height,
+        ppt.slide_width,
+        ppt.slide_height,
+    )
+    assert text_shapes[0].left == expected_left
+    assert text_shapes[0].top == expected_top
+    assert text_shapes[0].width == expected_width
+    assert text_shapes[0].height == expected_height
+    assert expected_top > 0
+
+
+def test_generate_pptx_preserves_inline_text_styles():
+    presentation = Presentation()
+    slide = Slide(page_id=1, width=1280.0, height=720.0)
+    slide.add_element(
+        TextElement(
+            content="Styled text",
+            bbox=[100.0, 100.0, 600.0, 180.0],
+            semantic_role="body",
+            bold=True,
+            italic=True,
+            underline=True,
+            strikethrough=True,
+        )
+    )
+    presentation.slides.append(slide)
+
+    output_path = Path(generate_pptx(presentation, template_key="default", request_id="test-inline-styles"))
+    ppt = PptxPresentation(str(output_path))
+    text_shapes = [shape for shape in ppt.slides[0].shapes if hasattr(shape, "text") and shape.text]
+
+    assert text_shapes
+    run = text_shapes[0].text_frame.paragraphs[0].runs[0]
+    assert run.font.bold is True
+    assert run.font.italic is True
+    assert run.font.underline is True
+    assert 'strike="sngStrike"' in run._r.xml
 
 
 def test_generate_pptx_separates_image_assets_from_text_when_available(tmp_path):

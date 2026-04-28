@@ -53,7 +53,7 @@ def _resolve_output_folder(
     input_file: Path,
     request_id: str | None,
     output_root: Path,
-    parse_method: str,
+    parse_method: str = "auto",
 ) -> Path | None:
     for candidate in _candidate_output_folders(input_file, request_id, output_root):
         if _has_mineru_artifacts(candidate):

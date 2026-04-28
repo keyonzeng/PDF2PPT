@@ -104,6 +104,8 @@ def _presentation_summary(presentation, request_id: str, filename: str, output_f
         fragmented_text = text_count >= 6 and short_text_count >= max(4, text_count - 1)
         high_complexity = element_count >= 12 or text_count >= 8 or table_count >= 1
         default_render_mode = "auto"
+        if slide.page_id == 1 and image_count == 0 and text_count <= 3:
+            default_render_mode = "image_fallback"
         if image_count > 0 and fragmented_text and high_complexity:
             default_render_mode = "image_fallback"
 

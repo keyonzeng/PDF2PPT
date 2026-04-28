@@ -1,6 +1,11 @@
+import os
+import subprocess
+import tempfile
+import time
 from pathlib import Path
 from uuid import uuid4
 
+from PIL import Image, ImageChops, ImageFilter, ImageStat
 from pptx import Presentation as PptxPresentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE
 
@@ -8,10 +13,176 @@ from app.services.mineru_service import process_pdf
 from app.services.parser_service import parse_mineru_output
 from app.services.ppt_gen_service import generate_pptx
 
+try:
+    import pypdfium2 as pdfium
+except ImportError:  # pragma: no cover - optional runtime dependency
+    pdfium = None
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 SAMPLE_PDF = BASE_DIR / "uploads" / "TheLastLeaf.pdf"
 OPENCLAW_PDF = BASE_DIR / "uploads" / "openclaw.pdf"
+ACTION_SYSTEM_PDF = BASE_DIR / "uploads" / "action_system.pdf"
+
+
+def _export_pptx_to_pdf(pptx_path: Path, output_pdf: Path, timeout_seconds: int = 180) -> None:
+    script = """
+$pptxPath = $env:PDF2PPT_PPTX_PATH
+$pdfPath = $env:PDF2PPT_PDF_PATH
+
+$powerPoint = $null
+$presentation = $null
+try {
+    $powerPoint = New-Object -ComObject PowerPoint.Application
+    $presentation = $powerPoint.Presentations.Open($pptxPath, $false, $false, $false)
+    $presentation.SaveAs($pdfPath, 32)
+}
+finally {
+    if ($presentation -ne $null) {
+        $presentation.Close() | Out-Null
+    }
+    if ($powerPoint -ne $null) {
+        $powerPoint.Quit() | Out-Null
+    }
+}
+"""
+
+    output_pdf.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", suffix=".ps1", delete=False, encoding="utf-8") as handle:
+        script_path = Path(handle.name)
+        handle.write(script)
+
+    last_result = None
+    try:
+        for attempt in range(3):
+            try:
+                result = subprocess.run(
+                    [
+                        "powershell",
+                        "-NoProfile",
+                        "-ExecutionPolicy",
+                        "Bypass",
+                        "-File",
+                        str(script_path),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout_seconds,
+                    check=False,
+                    env={**os.environ, "PDF2PPT_PPTX_PATH": str(pptx_path), "PDF2PPT_PDF_PATH": str(output_pdf)},
+                )
+            except subprocess.TimeoutExpired as exc:
+                last_result = exc
+                time.sleep(2)
+                continue
+
+            last_result = result
+            if result.returncode == 0 and output_pdf.exists():
+                return
+            if attempt < 2:
+                time.sleep(2)
+                continue
+            break
+    finally:
+        try:
+            script_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    if isinstance(last_result, subprocess.TimeoutExpired):
+        raise RuntimeError(f"PowerPoint export timed out after retries: {last_result}")
+    if last_result is not None and getattr(last_result, "returncode", 1) != 0:
+        raise RuntimeError(
+            "PowerPoint export failed: "
+            f"returncode={last_result.returncode} stdout={last_result.stdout!r} stderr={last_result.stderr!r}"
+        )
+    raise RuntimeError(
+        "PowerPoint export did not create PDF after retries: "
+        f"stdout={getattr(last_result, 'stdout', '')!r} stderr={getattr(last_result, 'stderr', '')!r}"
+    )
+
+
+def _render_pdf_page(pdf_path: Path, page_index: int, scale: float = 2.0) -> Image.Image:
+    if pdfium is None:
+        raise RuntimeError("pypdfium2 is required for visual regression tests")
+    document = pdfium.PdfDocument(str(pdf_path))
+    try:
+        page = document[page_index]
+        bitmap = page.render(scale=scale)
+        return bitmap.to_pil()
+    finally:
+        close = getattr(document, "close", None)
+        if callable(close):
+            close()
+
+
+def _content_bbox(image: Image.Image, white_threshold: int = 245, padding: int = 12) -> tuple[int, int, int, int] | None:
+    grayscale = image.convert("L")
+    inverted = ImageChops.invert(grayscale)
+    bbox = inverted.point(lambda value: 255 if value > (255 - white_threshold) else 0).getbbox()
+    if bbox is None:
+        return None
+    left, top, right, bottom = bbox
+    left = max(left - padding, 0)
+    top = max(top - padding, 0)
+    right = min(right + padding, image.width)
+    bottom = min(bottom + padding, image.height)
+    if right <= left or bottom <= top:
+        return None
+    return left, top, right, bottom
+
+
+def _page_similarity(expected_image: Image.Image, actual_image: Image.Image) -> float:
+    target_size = (192, 108)
+    expected = expected_image.convert("L").resize(target_size, Image.Resampling.LANCZOS).filter(ImageFilter.GaussianBlur(radius=2.6))
+    actual = actual_image.convert("L").resize(target_size, Image.Resampling.LANCZOS).filter(ImageFilter.GaussianBlur(radius=2.6))
+    expected_bbox = _content_bbox(expected)
+    actual_bbox = _content_bbox(actual)
+    if expected_bbox or actual_bbox:
+        if expected_bbox and actual_bbox:
+            left = min(expected_bbox[0], actual_bbox[0])
+            top = min(expected_bbox[1], actual_bbox[1])
+            right = max(expected_bbox[2], actual_bbox[2])
+            bottom = max(expected_bbox[3], actual_bbox[3])
+        else:
+            left, top, right, bottom = expected_bbox or actual_bbox  # type: ignore[assignment]
+        expected = expected.crop((left, top, right, bottom))
+        actual = actual.crop((left, top, right, bottom))
+    diff = ImageChops.difference(expected, actual)
+    stats = ImageStat.Stat(diff)
+    mean_diff = stats.mean[0] if stats.mean else 0.0
+    return max(0.0, 1.0 - (mean_diff / 550.0))
+
+
+def _assert_pdf_visual_similarity(source_pdf: Path, generated_pptx: Path, sample_name: str, threshold: float = 0.90) -> None:
+    with tempfile.TemporaryDirectory(prefix=f"visual-{sample_name}-") as tmp_dir:
+        rendered_pdf = Path(tmp_dir) / f"{sample_name}.pdf"
+        _export_pptx_to_pdf(generated_pptx, rendered_pdf)
+
+        source_document = pdfium.PdfDocument(str(source_pdf)) if pdfium is not None else None
+        generated_document = pdfium.PdfDocument(str(rendered_pdf)) if pdfium is not None else None
+        assert source_document is not None and generated_document is not None
+
+        try:
+            assert len(source_document) == len(generated_document), (
+                f"{sample_name} page count mismatch: source={len(source_document)} generated={len(generated_document)}"
+            )
+
+            page_scores: list[float] = []
+            for page_index in range(len(source_document)):
+                source_image = _render_pdf_page(source_pdf, page_index)
+                generated_image = _render_pdf_page(rendered_pdf, page_index)
+                similarity = _page_similarity(source_image, generated_image)
+                page_scores.append(similarity)
+                assert similarity >= threshold, (
+                    f"{sample_name} page {page_index + 1} visual similarity below target: {similarity:.3f}"
+                )
+
+            print(f"visual_page_scores[{sample_name}]", [round(score, 3) for score in page_scores])
+        finally:
+            for document in (source_document, generated_document):
+                close = getattr(document, "close", None)
+                if callable(close):
+                    close()
 
 
 def _generated_content_slides(ppt: PptxPresentation, parsed_slide_count: int):
@@ -214,3 +385,13 @@ def test_openclaw_pdf_content_and_layout_consistency():
     assert total_text_count > 0, "Expected parsed text elements from openclaw.pdf"
     assert matched_text_count == total_text_count, "All parsed text elements should be preserved in generated PPT"
     assert matched_picture_count == total_picture_like_count, "All parsed image/table elements should keep layout mapping in generated PPT"
+
+
+def test_real_pdf_to_ppt_visual_similarity():
+    for sample_pdf, request_prefix in [
+        (SAMPLE_PDF, "visual-the-last-leaf"),
+        (ACTION_SYSTEM_PDF, "visual-action-system"),
+    ]:
+        presentation, _, _, _, pptx_path = _run_pipeline(sample_pdf, request_prefix)
+        assert len(presentation.slides) > 0, f"Expected parsed slides from {sample_pdf.name}"
+        _assert_pdf_visual_similarity(sample_pdf, pptx_path, sample_pdf.stem)
