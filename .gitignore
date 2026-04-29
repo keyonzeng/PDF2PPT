@@ -118,3 +118,5 @@ claude_kimi.ps1
 # Optional IDE settings
 #.idea/
 #.vscode/
+.agents/
+

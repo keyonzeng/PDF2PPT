@@ -1,11 +1,11 @@
-from app.services.ppt_gen_service import generate_pptx, _element_geometry
+from app.services.ppt_gen_service import generate_pptx, _element_geometry, _build_text_masked_picture_stream
 from app.core.models import Presentation, Slide, TextElement, DocumentStyleProfile
 from app.core.models import ImageElement
 from app.main import _presentation_summary
 import os
 from pathlib import Path
 from pptx import Presentation as PptxPresentation
-from PIL import Image
+from PIL import Image, ImageDraw
 
 def test_generate_pptx_simple():
     # Arrange
@@ -205,6 +205,31 @@ def test_generate_pptx_separates_image_assets_from_text_when_available(tmp_path)
     assert len(picture_shapes) == 1
     assert picture_shapes[0].width < ppt.slide_width
     assert picture_shapes[0].height < ppt.slide_height
+
+
+def test_build_text_masked_picture_stream_masks_overlapping_text_regions(tmp_path):
+    image_path = tmp_path / "masked-source.png"
+    source_image = Image.new("RGBA", (200, 120), color=(232, 236, 240, 255))
+    draw = ImageDraw.Draw(source_image)
+    draw.rectangle((0, 0, 60, 40), fill=(18, 18, 18, 255))
+    source_image.save(image_path)
+
+    stream = _build_text_masked_picture_stream(
+        str(image_path),
+        [0.0, 0.0, 200.0, 120.0],
+        [[0.0, 0.0, 60.0, 40.0]],
+    )
+
+    assert stream is not None
+    masked_image = Image.open(stream).convert("RGBA")
+    patched_pixel = masked_image.getpixel((10, 10))
+    untouched_pixel = masked_image.getpixel((120, 60))
+
+    assert patched_pixel[:3] != (255, 255, 255)
+    assert abs(patched_pixel[0] - 232) <= 12
+    assert abs(patched_pixel[1] - 236) <= 12
+    assert abs(patched_pixel[2] - 240) <= 12
+    assert untouched_pixel[:3] == (232, 236, 240)
 
 
 def test_generate_pptx_applies_explicit_font_family_to_text_runs():

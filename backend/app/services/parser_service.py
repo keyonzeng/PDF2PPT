@@ -1,8 +1,23 @@
 import json
+import re
 import statistics
 from pathlib import Path
 from typing import Dict, Any, Optional
 from app.core.models import Presentation, Slide, TextElement, ImageElement, TableElement, Element, DocumentStyleProfile, StyleToken
+from app.core.config import settings
+
+# Regex to detect bullet/list prefix characters in extracted text
+_BULLET_PREFIX_RE = re.compile(
+    r'^[\·\•\-\*\◦\‣\⁃\▪\▫\→\⇒\■\□]\s*'
+    r'|'
+    r'^[0-9]+[\.\)\)]\s*'
+)
+
+
+def _is_bullet_item(elem: TextElement) -> bool:
+    """Return True if the element content starts with a bullet/list prefix."""
+    content = (elem.content or "").strip()
+    return bool(_BULLET_PREFIX_RE.search(content))
 
 def _infer_text_role(item: Dict[str, Any]) -> Optional[str]:
     text_level = item.get("text_level")
@@ -467,7 +482,7 @@ def _map_middle_block_to_element(block: Dict[str, Any], output_base_path: Path, 
     if len(bbox or []) == 4:
         raw_bbox = [float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])]
 
-    if block_type in {"title", "text"}:
+    if block_type in {"title", "text", "list"}:
         line_texts = _extract_line_texts_from_middle_block(block)
         line_bboxes = _extract_line_bboxes_from_middle_block(block)
         style = _extract_text_style_from_middle_block(block)
@@ -477,6 +492,10 @@ def _map_middle_block_to_element(block: Dict[str, Any], output_base_path: Path, 
         text_level, semantic_role = _infer_middle_text_role(block, page_width, page_height, archetype)
         content_stripped = content.strip()
         is_short_year_label = archetype == "two_column_compare" and semantic_role == "subtitle" and len(content_stripped) <= 8 and content_stripped.isdigit()
+        middle_font_size = _estimate_middle_font_size(block, page_height, semantic_role)
+        line_font_sizes = _estimate_line_font_sizes(line_bboxes, line_texts, page_height, semantic_role) or []
+        if settings.PARSER_UNIFY_LINE_FONT_SIZES and middle_font_size is not None and line_font_sizes:
+            line_font_sizes = [middle_font_size] * len(line_font_sizes)
         return TextElement(
             content=content,
             bbox=preferred_bbox or raw_bbox,
@@ -484,7 +503,7 @@ def _map_middle_block_to_element(block: Dict[str, Any], output_base_path: Path, 
             text_level=text_level,
             semantic_role=semantic_role,
             align=_infer_text_alignment(block, page_width, page_height, line_bboxes=line_bboxes),
-            font_size=_estimate_middle_font_size(block, page_height, semantic_role),
+            font_size=middle_font_size,
             bold=style.get("bold") if style.get("bold") is not None else (block_type == "title" or is_short_year_label),
             italic=style.get("italic"),
             underline=style.get("underline"),
@@ -494,11 +513,7 @@ def _map_middle_block_to_element(block: Dict[str, Any], output_base_path: Path, 
             bbox_fs=[float(value) for value in bbox_fs] if len(bbox_fs or []) == 4 else None,
             line_texts=line_texts or None,
             line_bboxes=line_bboxes or None,
-            line_font_sizes=(
-                [max(float(font_size := _estimate_middle_font_size(block, page_height, semantic_role) or 0.0), 8.0), max((font_size or 0.0) * 0.62, 8.0)]
-                if archetype == "infographic_node_map" and semantic_role == "title" and len(line_texts) == 2 and len(line_bboxes) == 2
-                else _estimate_line_font_sizes(line_bboxes, line_texts, page_height, semantic_role) or None
-            ),
+            line_font_sizes=line_font_sizes or None,
         )
 
     if block_type == "image":
@@ -580,6 +595,7 @@ def _merge_text_elements(elements: list[Element], page_width: float, page_height
             and left_delta <= 0.03
             and right_delta <= 0.04
             and width_ratio >= 0.6
+            and not (_is_bullet_item(previous) or _is_bullet_item(element))
         )
 
         if not can_merge:

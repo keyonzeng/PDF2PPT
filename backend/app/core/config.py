@@ -40,6 +40,12 @@ class Settings(BaseSettings):
     KIMI_MODEL: str = "moonshot-v1-8k"
     QWEN_MODEL: str = "qwen-turbo"
     
+    # Parser / PPT generation tuning
+    PARSER_UNIFY_LINE_FONT_SIZES: bool = True
+    PPT_LINE_SPACING_TITLE: float = 1.15
+    PPT_LINE_SPACING_SUBTITLE: float = 1.35
+    PPT_LINE_SPACING_BODY: float = 1.5
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 settings = Settings()

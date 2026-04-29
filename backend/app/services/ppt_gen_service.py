@@ -1,4 +1,6 @@
 import io
+import re
+import statistics
 
 from pptx import Presentation
 from pptx.dml.color import RGBColor
@@ -6,9 +8,10 @@ from pptx.enum.text import PP_ALIGN, MSO_ANCHOR, MSO_AUTO_SIZE
 from pptx.util import Pt, Inches
 from pptx.oxml.ns import qn
 from pptx.oxml.xmlchemy import OxmlElement
-from PIL import Image
+from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageStat
 from app.core.models import Presentation as DomainPresentation
 from app.core.models import TextElement, DocumentStyleProfile
+from app.core.config import settings
 from pathlib import Path
 
 try:
@@ -145,16 +148,102 @@ def _resolved_font_size_pt(textbox, elem: TextElement, fallback: float) -> float
     return max(min(estimated, box_height * 0.85 if box_height else estimated), 8.0)
 
 
+def _constrain_font_size_to_fit(textbox, elem: TextElement, base_size: float) -> float:
+    """Shrink font size so that the longest line fits inside the textbox width
+    and all lines fit inside the textbox height, preventing auto-wrap overflow."""
+    # Leave ~15 % horizontal padding for margins / inter-character spacing
+    width_pt = float(textbox.width) / 12700.0 * 0.85
+    height_pt = float(textbox.height) / 12700.0
+
+    line_texts = getattr(elem, "line_texts", None) or []
+    if not line_texts:
+        content = elem.content or ""
+        if content:
+            line_texts = [line for line in content.splitlines() if line.strip()]
+    if not line_texts:
+        return base_size
+
+    role = getattr(elem, "semantic_role", None)
+    if role == "title":
+        spacing = settings.PPT_LINE_SPACING_TITLE
+    elif role == "subtitle":
+        spacing = settings.PPT_LINE_SPACING_SUBTITLE
+    else:
+        spacing = settings.PPT_LINE_SPACING_BODY
+
+    num_lines = len(line_texts)
+
+    # Height constraint: always apply so total lines fit in the box
+    max_size_by_height = base_size
+    if num_lines > 0 and height_pt > 0:
+        max_size_by_height = height_pt / (num_lines * spacing)
+
+    # Width constraint: for EVERY line in the block, ensure the text fits
+    # inside the textbox width without PowerPoint auto-wrapping.
+    # We take the most restrictive line so the unified block font size keeps
+    # all original lines on single visual rows.
+    max_size_by_width = base_size
+    max_width_units = 0.0
+    for line in line_texts:
+        # Conservative estimates for PowerPoint rendering:
+        # CJK full-width chars ~1.0× font pt; Latin ~0.55×
+        units = sum(1.0 if "\u4e00" <= ch <= "\u9fff" else 0.55 for ch in line)
+        max_width_units = max(max_width_units, units)
+    if max_width_units > 0:
+        max_size_by_width = width_pt / max_width_units
+
+    constrained = min(base_size, max_size_by_width, max_size_by_height)
+    return max(constrained, 6.0)
+
+
 def _paragraph_font_size_pt(textbox, elem: TextElement, paragraph_index: int, fallback: float) -> float:
     line_font_sizes = getattr(elem, "line_font_sizes", None) or []
-    if paragraph_index < len(line_font_sizes):
-        return max(float(line_font_sizes[paragraph_index]), 8.0)
-    return _resolved_font_size_pt(textbox, elem, fallback)
+    if line_font_sizes:
+        base_size = max(float(max(line_font_sizes)), 8.0)
+    else:
+        base_size = _resolved_font_size_pt(textbox, elem, fallback)
+
+    return _constrain_font_size_to_fit(textbox, elem, base_size)
+
+
+def _is_bullet_line(line: str) -> bool:
+    """Return True if the line starts with a bullet/list prefix character."""
+    return bool(re.search(r'^[\·\•\-\*\◦\‣\⁃\▪\▫\→\⇒\■\□]\s*', line.strip()))
+
+
+def _strip_bullet_prefix(line: str) -> str:
+    """Remove bullet prefix character from a line."""
+    return re.sub(r'^[\·\•\-\*\◦\‣\⁃\▪\▫\→\⇒\■\□]\s*', '', line.strip())
+
+
+def _set_paragraph_bullet(paragraph, char: str = "•") -> None:
+    """Set a custom bullet character on a PowerPoint paragraph via OOXML."""
+    pPr = paragraph._p.get_or_add_pPr()
+
+    # Remove any existing bullet-none element
+    bu_none = pPr.find(qn("a:buNone"))
+    if bu_none is not None:
+        pPr.remove(bu_none)
+
+    # Remove existing buChar elements to avoid duplicates
+    for existing in pPr.findall(qn("a:buChar")):
+        pPr.remove(existing)
+
+    bu_char = OxmlElement("a:buChar")
+    bu_char.set("char", char)
+    pPr.append(bu_char)
 
 
 def _should_word_wrap_text(elem: TextElement, content: str, line_texts: list[str]) -> bool:
     role = getattr(elem, "semantic_role", None)
-    if role in {"body", "subtitle", "caption"} and len(content) >= 18:
+    if role not in {"body", "subtitle", "caption"}:
+        return False
+    # If the original PDF already broke this text into multiple lines,
+    # honour that by allowing word wrap.  If it was a single line, keep it
+    # on one line and let the constrained font size handle the fit.
+    if line_texts and len(line_texts) == 1 and "\n" not in content:
+        return False
+    if len(content) >= 18:
         return True
     return False
 
@@ -175,77 +264,105 @@ def _apply_text_style(textbox, elem: TextElement, is_cover_slide: bool) -> None:
     accent_color = _hex_to_rgb(getattr(elem, "color", None), (17, 17, 17))
 
     for paragraph_index, paragraph in enumerate(text_frame.paragraphs):
-        run = paragraph.runs[0] if paragraph.runs else paragraph.add_run()
+        runs = [run for run in (paragraph.runs or []) if run.font]
+        if not runs:
+            runs = [paragraph.add_run()]
         paragraph.alignment = _alignment_value(getattr(elem, "align", None) or getattr(getattr(profile, "body_style", None), "align", "left"))
         paragraph.space_before = Pt(0)
         paragraph.space_after = Pt(0)
 
         if is_cover_slide and role == "title":
-            run.font.size = Pt(_paragraph_font_size_pt(textbox, elem, paragraph_index, 30) * 0.9)
+            target_size = _paragraph_font_size_pt(textbox, elem, paragraph_index, 30) * 0.9
             is_split_parenthetical_line = (paragraph_index > 0 and (paragraph.text or "").strip().startswith(("（", "("))) or content.startswith(("（", "("))
-            run.font.bold = False if is_split_parenthetical_line else True
-            run.font.color.rgb = subtitle_color if is_split_parenthetical_line else accent_color
-            _set_run_font_name(run, _infer_font_name(content, getattr(elem, "font_name", None) or getattr(getattr(profile, "title_style", None), "font_name", None) or resolved_font_name))
-            _apply_run_inline_styles(run, elem)
+            for run in runs:
+                run.font.size = Pt(target_size)
+                run.font.bold = False if is_split_parenthetical_line else True
+                run.font.color.rgb = subtitle_color if is_split_parenthetical_line else accent_color
+                _set_run_font_name(run, _infer_font_name(content, getattr(elem, "font_name", None) or getattr(getattr(profile, "title_style", None), "font_name", None) or resolved_font_name))
+                _apply_run_inline_styles(run, elem)
             paragraph.alignment = _alignment_value(getattr(elem, "align", None) or "left")
         elif is_cover_slide and role in {"subtitle", "body"} and len(content) <= 40:
-            run.font.size = Pt(_paragraph_font_size_pt(textbox, elem, paragraph_index, 18) * 0.9)
-            run.font.bold = bool(getattr(elem, "bold", None))
-            run.font.color.rgb = subtitle_color
-            _set_run_font_name(run, _infer_font_name(content, getattr(elem, "font_name", None) or getattr(getattr(profile, "subtitle_style", None), "font_name", None) or resolved_font_name))
-            _apply_run_inline_styles(run, elem)
+            target_size = _paragraph_font_size_pt(textbox, elem, paragraph_index, 18) * 0.9
+            for run in runs:
+                run.font.size = Pt(target_size)
+                run.font.bold = bool(getattr(elem, "bold", None))
+                run.font.color.rgb = subtitle_color
+                _set_run_font_name(run, _infer_font_name(content, getattr(elem, "font_name", None) or getattr(getattr(profile, "subtitle_style", None), "font_name", None) or resolved_font_name))
+                _apply_run_inline_styles(run, elem)
             paragraph.alignment = _alignment_value(getattr(elem, "align", None) or "left")
         elif role == "title":
-            run.font.size = Pt(_paragraph_font_size_pt(textbox, elem, paragraph_index, getattr(getattr(profile, "title_style", None), "font_size", 24) or 24))
+            target_size = _paragraph_font_size_pt(textbox, elem, paragraph_index, getattr(getattr(profile, "title_style", None), "font_size", 24) or 24)
             is_split_parenthetical_line = (paragraph_index > 0 and (paragraph.text or "").strip().startswith(("（", "("))) or content.startswith(("（", "("))
-            run.font.bold = False if is_split_parenthetical_line else (True if getattr(elem, "bold", None) is None else bool(getattr(elem, "bold", None)))
-            run.font.color.rgb = subtitle_color if is_split_parenthetical_line else title_color
-            _set_run_font_name(run, _infer_font_name(content, getattr(elem, "font_name", None) or getattr(getattr(profile, "title_style", None), "font_name", None) or resolved_font_name))
-            _apply_run_inline_styles(run, elem)
+            for run in runs:
+                run.font.size = Pt(target_size)
+                run.font.bold = False if is_split_parenthetical_line else (True if getattr(elem, "bold", None) is None else bool(getattr(elem, "bold", None)))
+                run.font.color.rgb = subtitle_color if is_split_parenthetical_line else title_color
+                _set_run_font_name(run, _infer_font_name(content, getattr(elem, "font_name", None) or getattr(getattr(profile, "title_style", None), "font_name", None) or resolved_font_name))
+                _apply_run_inline_styles(run, elem)
             paragraph.alignment = _alignment_value(getattr(elem, "align", None) or getattr(getattr(profile, "title_style", None), "align", "left"))
         elif role == "subtitle":
-            run.font.size = Pt(_paragraph_font_size_pt(textbox, elem, paragraph_index, getattr(getattr(profile, "subtitle_style", None), "font_size", 18) or 18))
-            run.font.bold = bool(getattr(elem, "bold", None))
-            run.font.color.rgb = subtitle_color
-            _set_run_font_name(run, _infer_font_name(content, getattr(elem, "font_name", None) or getattr(getattr(profile, "subtitle_style", None), "font_name", None) or resolved_font_name))
-            _apply_run_inline_styles(run, elem)
+            target_size = _paragraph_font_size_pt(textbox, elem, paragraph_index, getattr(getattr(profile, "subtitle_style", None), "font_size", 18) or 18)
+            for run in runs:
+                run.font.size = Pt(target_size)
+                run.font.bold = bool(getattr(elem, "bold", None))
+                run.font.color.rgb = subtitle_color
+                _set_run_font_name(run, _infer_font_name(content, getattr(elem, "font_name", None) or getattr(getattr(profile, "subtitle_style", None), "font_name", None) or resolved_font_name))
+                _apply_run_inline_styles(run, elem)
             paragraph.alignment = _alignment_value(getattr(elem, "align", None) or getattr(getattr(profile, "subtitle_style", None), "align", "left"))
         elif role == "caption":
-            run.font.size = Pt(_paragraph_font_size_pt(textbox, elem, paragraph_index, getattr(getattr(profile, "caption_style", None), "font_size", 12) or 12))
-            run.font.bold = bool(getattr(elem, "bold", None))
-            run.font.color.rgb = subtitle_color
-            _set_run_font_name(run, _infer_font_name(content, getattr(elem, "font_name", None) or getattr(getattr(profile, "caption_style", None), "font_name", None) or resolved_font_name))
-            _apply_run_inline_styles(run, elem)
+            target_size = _paragraph_font_size_pt(textbox, elem, paragraph_index, getattr(getattr(profile, "caption_style", None), "font_size", 12) or 12)
+            for run in runs:
+                run.font.size = Pt(target_size)
+                run.font.bold = bool(getattr(elem, "bold", None))
+                run.font.color.rgb = subtitle_color
+                _set_run_font_name(run, _infer_font_name(content, getattr(elem, "font_name", None) or getattr(getattr(profile, "caption_style", None), "font_name", None) or resolved_font_name))
+                _apply_run_inline_styles(run, elem)
             paragraph.alignment = _alignment_value(getattr(elem, "align", None) or getattr(getattr(profile, "caption_style", None), "align", "left"))
         else:
-            run.font.size = Pt(_paragraph_font_size_pt(textbox, elem, paragraph_index, getattr(getattr(profile, "body_style", None), "font_size", 16) or 16))
-            run.font.bold = bool(getattr(elem, "bold", None))
-            run.font.color.rgb = title_color
-            _set_run_font_name(run, resolved_font_name)
-            _apply_run_inline_styles(run, elem)
+            target_size = _paragraph_font_size_pt(textbox, elem, paragraph_index, getattr(getattr(profile, "body_style", None), "font_size", 16) or 16)
+            for run in runs:
+                run.font.size = Pt(target_size)
+                run.font.bold = bool(getattr(elem, "bold", None))
+                run.font.color.rgb = title_color
+                _set_run_font_name(run, resolved_font_name)
+                _apply_run_inline_styles(run, elem)
 
-        if archetype == "single_visual_explainer" and role == "title" and run.font.size is not None:
-            run.font.size = Pt(max(float(run.font.size.pt) * 0.92, 10.0))
-        if archetype == "single_visual_explainer" and role in {"subtitle", "body", "caption"} and run.font.size is not None:
-            run.font.size = Pt(max(float(run.font.size.pt) * 0.93, 8.0))
+        first_run = runs[0]
+        first_run_size_pt = float(first_run.font.size.pt) if first_run.font.size is not None else None
+        if archetype == "single_visual_explainer" and role == "title" and first_run_size_pt is not None:
+            for run in runs:
+                run.font.size = Pt(max(first_run_size_pt * 0.92, 10.0))
+        if archetype == "single_visual_explainer" and role in {"subtitle", "body", "caption"} and first_run_size_pt is not None:
+            for run in runs:
+                run.font.size = Pt(max(first_run_size_pt * 0.93, 8.0))
 
         if archetype == "infographic_node_map" and role == "caption":
-            run.font.size = Pt(11)
+            for run in runs:
+                run.font.size = Pt(11)
             paragraph.alignment = PP_ALIGN.CENTER
-        if archetype == "infographic_node_map" and role in {"subtitle", "body", "caption"} and run.font.size is not None:
-            run.font.size = Pt(max(float(run.font.size.pt) * 0.85, 8.0))
+        if archetype == "infographic_node_map" and role in {"subtitle", "body", "caption"} and first_run_size_pt is not None:
+            for run in runs:
+                run.font.size = Pt(max(first_run_size_pt * 0.85, 8.0))
         if archetype == "policy_text_heavy" and role == "title":
-            run.font.size = Pt(26)
+            for run in runs:
+                run.font.size = Pt(26)
 
+        unified_size_pt = float(first_run.font.size.pt) if first_run.font.size is not None else None
         if len(text_frame.paragraphs) > 1:
             if role == "title":
-                paragraph.space_after = Pt(max(float(run.font.size.pt) * 0.22, 2.0))
+                paragraph.space_after = Pt(max(unified_size_pt * 0.22, 2.0)) if unified_size_pt else Pt(2.0)
             elif role in {"subtitle", "body", "caption"}:
-                paragraph.space_after = Pt(max(float(run.font.size.pt) * 0.10, 1.0))
+                paragraph.space_after = Pt(max(unified_size_pt * 0.10, 1.0)) if unified_size_pt else Pt(1.0)
 
-        font_size = run.font.size
+        font_size = first_run.font.size
         if font_size is not None:
-            paragraph.line_spacing = Pt(max(float(font_size.pt) * 1.15, 1.0))
+            if role == "title":
+                line_spacing_multiplier = settings.PPT_LINE_SPACING_TITLE
+            elif role == "subtitle":
+                line_spacing_multiplier = settings.PPT_LINE_SPACING_SUBTITLE
+            else:
+                line_spacing_multiplier = settings.PPT_LINE_SPACING_BODY
+            paragraph.line_spacing = Pt(max(float(font_size.pt) * line_spacing_multiplier, 1.0))
 
 
 def _apply_archetype_layout_hints(slide, d_slide, profile: DocumentStyleProfile) -> None:
@@ -303,18 +420,47 @@ def _render_text_element(slide, elem, left: int, top: int, width: int, height: i
     tf.margin_top = 0
     tf.margin_bottom = 0
     line_texts = [line for line in (getattr(elem, "line_texts", None) or []) if line.strip()]
-    content_text = (elem.content or "").replace("\n", "\v")
-    normalized_content = _normalized_text(content_text.replace("\v", "\n"))
-    normalized_line_texts = _normalized_text("\n".join(line_texts)) if line_texts else ""
-    should_render_lines_as_paragraphs = len(line_texts) > 1 and normalized_line_texts == normalized_content and role in {"title", "subtitle"}
-    if should_render_lines_as_paragraphs:
+    is_bullet_block = any(_is_bullet_line(line) for line in line_texts) if line_texts else _is_bullet_line(elem.content or "")
+
+    if is_bullet_block:
+        # Bullet item: merge continuation lines into one paragraph per bullet,
+        # strip original bullet prefix, and add PowerPoint bullet character.
         first_paragraph = tf.paragraphs[0]
-        first_paragraph.text = line_texts[0]
-        for line_text in line_texts[1:]:
-            paragraph = tf.add_paragraph()
-            paragraph.text = line_text
+        bullet_texts: list[str] = []
+        current_parts: list[str] = []
+
+        for line in line_texts:
+            if _is_bullet_line(line):
+                if current_parts:
+                    bullet_texts.append(" ".join(current_parts))
+                current_parts = [_strip_bullet_prefix(line)]
+            else:
+                stripped = line.strip()
+                if stripped:
+                    current_parts.append(stripped)
+        if current_parts:
+            bullet_texts.append(" ".join(current_parts))
+
+        if bullet_texts:
+            first_paragraph.text = bullet_texts[0]
+            _set_paragraph_bullet(first_paragraph, "•")
+            for text in bullet_texts[1:]:
+                paragraph = tf.add_paragraph()
+                paragraph.text = text
+                _set_paragraph_bullet(paragraph, "•")
     else:
-        tf.text = content_text
+        content_text = (elem.content or "").replace("\n", "\v")
+        normalized_content = _normalized_text(content_text.replace("\v", "\n"))
+        normalized_line_texts = _normalized_text("\n".join(line_texts)) if line_texts else ""
+        should_render_lines_as_paragraphs = len(line_texts) > 1 and normalized_line_texts == normalized_content and role in {"title", "subtitle"}
+        if should_render_lines_as_paragraphs:
+            first_paragraph = tf.paragraphs[0]
+            first_paragraph.text = line_texts[0]
+            for line_text in line_texts[1:]:
+                paragraph = tf.add_paragraph()
+                paragraph.text = line_text
+        else:
+            tf.text = content_text
     tf.word_wrap = _should_word_wrap_text(elem, elem.content or "", line_texts)
     _apply_text_style(textbox, elem, is_cover_slide)
 
@@ -354,10 +500,65 @@ def _render_page_image(source_pdf_document, page_index: int, page_image_cache: d
     return pil_image
 
 
+def _mask_text_regions_in_image(image: Image.Image, image_bbox: list[float], text_bboxes: list[list[float]]) -> Image.Image | None:
+    if len(image_bbox) != 4 or not text_bboxes:
+        return None
+
+    try:
+        rgba = image.convert("RGBA")
+        width, height = rgba.size
+        if width <= 0 or height <= 0:
+            return None
+
+        image_left, image_top, image_right, image_bottom = [float(value) for value in image_bbox]
+        image_width = max(image_right - image_left, 1.0)
+        image_height = max(image_bottom - image_top, 1.0)
+        has_overlap = False
+
+        for text_bbox in text_bboxes:
+            intersection = _bbox_intersection(image_bbox, text_bbox)
+            if intersection is None:
+                continue
+
+            has_overlap = True
+            overlap_left, overlap_top, overlap_right, overlap_bottom = intersection
+            pixel_left = int(round(((overlap_left - image_left) / image_width) * width))
+            pixel_top = int(round(((overlap_top - image_top) / image_height) * height))
+            pixel_right = int(round(((overlap_right - image_left) / image_width) * width))
+            pixel_bottom = int(round(((overlap_bottom - image_top) / image_height) * height))
+
+            pixel_left = max(0, min(width - 1, pixel_left))
+            pixel_top = max(0, min(height - 1, pixel_top))
+            pixel_right = max(pixel_left + 1, min(width, pixel_right))
+            pixel_bottom = max(pixel_top + 1, min(height, pixel_bottom))
+
+            padding = 2
+            pixel_left = max(0, pixel_left - padding)
+            pixel_top = max(0, pixel_top - padding)
+            pixel_right = min(width, pixel_right + padding)
+            pixel_bottom = min(height, pixel_bottom + padding)
+            fill_color = _sample_local_background_color(rgba, (pixel_left, pixel_top, pixel_right, pixel_bottom))
+            if fill_color is None:
+                continue
+            rgba = _paint_background_patch(rgba, (pixel_left, pixel_top, pixel_right, pixel_bottom), fill_color)
+
+        if not has_overlap:
+            return None
+
+        return rgba
+    except Exception:
+        return None
+
+    page_image_cache[page_index] = pil_image
+    return pil_image
+
+
 def _render_picture_element(slide, elem, left: int, top: int, width: int, height: int, image_size_cache: dict[str, tuple[int, int]], source_pdf_document=None, page_index: int | None = None, pdf_w: float | None = None, pdf_h: float | None = None, page_image_cache: dict[int, Image.Image] | None = None) -> None:
     img_path = getattr(elem, "path", None)
     if img_path and Path(img_path).exists():
-        _add_picture_cover(slide, img_path, left, top, width, height, image_size_cache)
+        text_bboxes = [text_element.bbox for text_element in getattr(slide, "_pdf2ppt_text_elements", []) if getattr(text_element, "bbox", None)]
+        picture_source = _build_text_masked_picture_stream(img_path, list(getattr(elem, "bbox", []) or []), text_bboxes)
+        _add_picture_cover(slide, img_path, left, top, width, height, image_size_cache, picture_source=picture_source)
         return
 
     if source_pdf_document is None or page_index is None or pdf_w is None or pdf_h is None:
@@ -368,6 +569,8 @@ def _render_picture_element(slide, elem, left: int, top: int, width: int, height
     page_image = _render_page_image(source_pdf_document, page_index, page_image_cache)
     if page_image is None:
         return
+
+    text_bboxes = [text_element.bbox for text_element in getattr(slide, "_pdf2ppt_text_elements", []) if getattr(text_element, "bbox", None)]
 
     bbox = getattr(elem, "bbox", None) or []
     if len(bbox) != 4:
@@ -384,6 +587,10 @@ def _render_picture_element(slide, elem, left: int, top: int, width: int, height
         cropped = page_image.crop((crop_left, crop_top, crop_right, crop_bottom))
     except Exception:
         return
+
+    masked_crop = _mask_text_regions_in_image(cropped, [x0, y0, x1, y1], text_bboxes)
+    if masked_crop is not None:
+        cropped = masked_crop
 
     stream = io.BytesIO()
     cropped.save(stream, format="PNG")
@@ -504,6 +711,7 @@ def _render_ppt_like_fidelity(slide, d_slide, pdf_w: float, pdf_h: float, ppt_w:
 def _render_generic_archetype(slide, d_slide, pdf_w: float, pdf_h: float, ppt_w: int, ppt_h: int, is_cover_slide: bool, image_size_cache: dict[str, tuple[int, int]], source_pdf_document=None) -> None:
     page_index = _slide_page_index(d_slide)
     page_image_cache: dict[int, Image.Image] = {}
+    slide._pdf2ppt_text_elements = [element for element in d_slide.elements if element.type == "text"]
     for elem in _sorted_elements_for_render(d_slide):
         if not elem.bbox:
             continue
@@ -593,29 +801,232 @@ def _get_image_size(img_path: str, image_size_cache: dict[str, tuple[int, int]])
     return size
 
 
-def _add_picture_cover(slide, img_path: str, left: int, top: int, width: int, height: int, image_size_cache: dict[str, tuple[int, int]]) -> None:
+def _compute_content_crop(img_path: str) -> tuple[float, float, float, float]:
+    """Return (left, top, right, bottom) crop ratios to trim background/whitespace.
+
+    Uses the alpha channel when available; otherwise samples border pixels to
+    estimate the background colour and crops to the bounding box of pixels
+    that differ from it by more than a threshold.
+    """
+    try:
+        with Image.open(img_path) as img:
+            rgba = img.convert("RGBA")
+            w, h = rgba.size
+            if w <= 0 or h <= 0:
+                return (0.0, 0.0, 0.0, 0.0)
+
+            r, g, b, a = rgba.split()
+
+            # 1. Alpha mask (fast LUT)
+            alpha_mask = a.point(lambda v: 255 if v > 10 else 0)
+
+            # 2. Background colour from unique border samples
+            samples = set()
+            for x in range(w):
+                samples.add(rgba.getpixel((x, 0)))
+                samples.add(rgba.getpixel((x, h - 1)))
+            for y in range(h):
+                samples.add(rgba.getpixel((0, y)))
+                samples.add(rgba.getpixel((w - 1, y)))
+            if not samples:
+                return (0.0, 0.0, 0.0, 0.0)
+
+            bg_r = int(statistics.median(p[0] for p in samples))
+            bg_g = int(statistics.median(p[1] for p in samples))
+            bg_b = int(statistics.median(p[2] for p in samples))
+
+            # 3. Difference from background per channel (fast LUT)
+            threshold = 20
+            r_diff = r.point(lambda v: abs(v - bg_r))
+            g_diff = g.point(lambda v: abs(v - bg_g))
+            b_diff = b.point(lambda v: abs(v - bg_b))
+
+            # 4. Combine: max(diff_r, diff_g, diff_b)
+            diff = ImageChops.lighter(ImageChops.lighter(r_diff, g_diff), b_diff)
+            colour_mask = diff.point(lambda v: 255 if v > threshold else 0)
+
+            # 5. Final mask = colour_mask OR alpha_mask
+            final_mask = ImageChops.lighter(colour_mask, alpha_mask)
+
+            bbox = final_mask.getbbox()
+            if not bbox:
+                return (0.0, 0.0, 0.0, 0.0)
+
+            # Sanity check: ignore if detected content is < 2 % of total area
+            content_area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
+            if content_area < 0.02 * w * h:
+                return (0.0, 0.0, 0.0, 0.0)
+
+            return (
+                bbox[0] / w,
+                bbox[1] / h,
+                (w - bbox[2]) / w,
+                (h - bbox[3]) / h,
+            )
+    except Exception:
+        return (0.0, 0.0, 0.0, 0.0)
+
+
+def _bbox_intersection(a: list[float] | tuple[float, float, float, float], b: list[float] | tuple[float, float, float, float]) -> tuple[float, float, float, float] | None:
+    if len(a) != 4 or len(b) != 4:
+        return None
+
+    left = max(float(a[0]), float(b[0]))
+    top = max(float(a[1]), float(b[1]))
+    right = min(float(a[2]), float(b[2]))
+    bottom = min(float(a[3]), float(b[3]))
+    if right <= left or bottom <= top:
+        return None
+    return left, top, right, bottom
+
+
+def _sample_local_background_color(rgba: Image.Image, fill_bbox: tuple[int, int, int, int], border_size: int = 8) -> tuple[int, int, int] | None:
+    width, height = rgba.size
+    left, top, right, bottom = fill_bbox
+    regions: list[Image.Image] = []
+
+    if top > 0:
+        regions.append(rgba.crop((left, max(0, top - border_size), right, top)))
+    if bottom < height:
+        regions.append(rgba.crop((left, bottom, right, min(height, bottom + border_size))))
+    if left > 0:
+        regions.append(rgba.crop((max(0, left - border_size), top, left, bottom)))
+    if right < width:
+        regions.append(rgba.crop((right, top, min(width, right + border_size), bottom)))
+
+    weighted_channels = [0.0, 0.0, 0.0]
+    total_weight = 0.0
+    for region in regions:
+        if region.width <= 0 or region.height <= 0:
+            continue
+        stat = ImageStat.Stat(region)
+        weight = float(region.width * region.height)
+        for index in range(3):
+            weighted_channels[index] += float(stat.mean[index]) * weight
+        total_weight += weight
+
+    if total_weight > 0:
+        return tuple(int(round(weighted_channels[index] / total_weight)) for index in range(3))
+
+    samples: list[tuple[int, int, int, int]] = []
+    for x in range(width):
+        samples.append(rgba.getpixel((x, 0)))
+        samples.append(rgba.getpixel((x, height - 1)))
+    for y in range(height):
+        samples.append(rgba.getpixel((0, y)))
+        samples.append(rgba.getpixel((width - 1, y)))
+
+    if not samples:
+        return None
+
+    return (
+        int(round(statistics.median(pixel[0] for pixel in samples))),
+        int(round(statistics.median(pixel[1] for pixel in samples))),
+        int(round(statistics.median(pixel[2] for pixel in samples))),
+    )
+
+
+def _paint_background_patch(rgba: Image.Image, fill_bbox: tuple[int, int, int, int], fill_color: tuple[int, int, int], feather_radius: float = 2.0) -> Image.Image:
+    patch = Image.new("RGBA", rgba.size, fill_color + (255,))
+    mask = Image.new("L", rgba.size, 0)
+    draw = ImageDraw.Draw(mask)
+    draw.rectangle(fill_bbox, fill=255)
+    if feather_radius > 0:
+        mask = mask.filter(ImageFilter.GaussianBlur(radius=feather_radius))
+    return Image.composite(patch, rgba, mask)
+
+
+def _build_text_masked_picture_stream(img_path: str, image_bbox: list[float], text_bboxes: list[list[float]]) -> io.BytesIO | None:
+    if len(image_bbox) != 4 or not text_bboxes:
+        return None
+
+    try:
+        with Image.open(img_path) as img:
+            rgba = img.convert("RGBA")
+            width, height = rgba.size
+            if width <= 0 or height <= 0:
+                return None
+
+            image_left, image_top, image_right, image_bottom = [float(value) for value in image_bbox]
+            image_width = max(image_right - image_left, 1.0)
+            image_height = max(image_bottom - image_top, 1.0)
+            has_overlap = False
+
+            for text_bbox in text_bboxes:
+                intersection = _bbox_intersection(image_bbox, text_bbox)
+                if intersection is None:
+                    continue
+
+                has_overlap = True
+                overlap_left, overlap_top, overlap_right, overlap_bottom = intersection
+                pixel_left = int(round(((overlap_left - image_left) / image_width) * width))
+                pixel_top = int(round(((overlap_top - image_top) / image_height) * height))
+                pixel_right = int(round(((overlap_right - image_left) / image_width) * width))
+                pixel_bottom = int(round(((overlap_bottom - image_top) / image_height) * height))
+
+                pixel_left = max(0, min(width - 1, pixel_left))
+                pixel_top = max(0, min(height - 1, pixel_top))
+                pixel_right = max(pixel_left + 1, min(width, pixel_right))
+                pixel_bottom = max(pixel_top + 1, min(height, pixel_bottom))
+
+                padding = 2
+                pixel_left = max(0, pixel_left - padding)
+                pixel_top = max(0, pixel_top - padding)
+                pixel_right = min(width, pixel_right + padding)
+                pixel_bottom = min(height, pixel_bottom + padding)
+                fill_color = _sample_local_background_color(rgba, (pixel_left, pixel_top, pixel_right, pixel_bottom))
+                if fill_color is None:
+                    continue
+                rgba = _paint_background_patch(rgba, (pixel_left, pixel_top, pixel_right, pixel_bottom), fill_color)
+
+            if not has_overlap:
+                return None
+
+            stream = io.BytesIO()
+            rgba.save(stream, format="PNG")
+            stream.seek(0)
+            return stream
+    except Exception:
+        return None
+
+
+def _add_picture_cover(slide, img_path: str, left: int, top: int, width: int, height: int, image_size_cache: dict[str, tuple[int, int]], picture_source=None) -> None:
     image_width, image_height = _get_image_size(img_path, image_size_cache)
+    source = picture_source if picture_source is not None else img_path
 
     if image_width <= 0 or image_height <= 0:
-        slide.shapes.add_picture(img_path, left, top, width=width, height=height)
+        slide.shapes.add_picture(source, left, top, width=width, height=height)
         return
 
-    picture = slide.shapes.add_picture(img_path, left, top, width=width, height=height)
-    frame_aspect = width / height if height else 1
-    image_aspect = image_width / image_height if image_height else frame_aspect
+    picture = slide.shapes.add_picture(source, left, top, width=width, height=height)
 
-    if image_aspect > frame_aspect:
-        crop = (1 - (frame_aspect / image_aspect)) / 2
-        picture.crop_left = crop
-        picture.crop_right = crop
-        picture.crop_top = 0
-        picture.crop_bottom = 0
+    # Content-aware crop: trim whitespace/background so the visible image
+    # occupies less of the rectangular MinerU bbox, reducing overlap with
+    # neighbouring text elements.
+    c_left, c_top, c_right, c_bottom = _compute_content_crop(img_path)
+
+    content_width = image_width * (1 - c_left - c_right)
+    content_height = image_height * (1 - c_top - c_bottom)
+    frame_aspect = width / height if height else 1
+    content_aspect = content_width / content_height if content_height else frame_aspect
+
+    if content_aspect > frame_aspect:
+        aspect_crop = (1 - (frame_aspect / content_aspect)) / 2
+        total_crop_left = c_left + (1 - c_left - c_right) * aspect_crop
+        total_crop_right = c_right + (1 - c_left - c_right) * aspect_crop
+        total_crop_top = c_top
+        total_crop_bottom = c_bottom
     else:
-        crop = (1 - (image_aspect / frame_aspect)) / 2 if frame_aspect else 0
-        picture.crop_top = crop
-        picture.crop_bottom = crop
-        picture.crop_left = 0
-        picture.crop_right = 0
+        aspect_crop = (1 - (content_aspect / frame_aspect)) / 2 if frame_aspect else 0
+        total_crop_top = c_top + (1 - c_top - c_bottom) * aspect_crop
+        total_crop_bottom = c_bottom + (1 - c_top - c_bottom) * aspect_crop
+        total_crop_left = c_left
+        total_crop_right = c_right
+
+    picture.crop_left = total_crop_left
+    picture.crop_right = total_crop_right
+    picture.crop_top = total_crop_top
+    picture.crop_bottom = total_crop_bottom
 
 
 def generate_pptx(
